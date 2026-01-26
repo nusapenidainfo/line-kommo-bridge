@@ -1,62 +1,31 @@
-// index.js
-// Простой сервер для LINE Webhook → (позже добавим Kommo)
-
-const express = require("express");
-const crypto = require("crypto");
+const express = require('express');
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-// Чтобы Express понимал JSON-тело запроса от LINE
+// Чтобы принимать JSON из LINE и Kommo
 app.use(express.json());
 
-// Секрет канала LINE берём из переменной окружения
-// (пока можно оставить пустым, позже настроим на Render)
-const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
-
-// Проверка подписи от LINE (защита от подделки запросов)
-function isValidLineSignature(req) {
-  if (!LINE_CHANNEL_SECRET) {
-    // Если секрет не настроен – пропускаем проверку
-    return true;
-  }
-
-  const signature = req.headers["x-line-signature"];
-  if (!signature) return false;
-
-  const body = JSON.stringify(req.body);
-  const hash = crypto
-    .createHmac("sha256", LINE_CHANNEL_SECRET)
-    .update(body)
-    .digest("base64");
-
-  return signature === hash;
-}
-
-// 1) Простой тестовый эндпоинт – чтобы проверять, что сервер жив
-app.get("/health", (req, res) => {
-  res.send("LINE → Kommo bridge is running ✅");
+// Простой health-check, чтобы проверять, жив ли сервер
+app.get('/', (req, res) => {
+  res.send('LINE–Kommo bridge is running');
 });
 
-// 2) Основной Webhook-эндпоинт для LINE
-app.post("/line/webhook", (req, res) => {
-  // Проверяем подпись
-  if (!isValidLineSignature(req)) {
-    console.log("❌ Invalid LINE signature");
-    return res.status(401).send("Invalid signature");
-  }
+// Вебхук для LINE
+app.post('/line/webhook', (req, res) => {
+  console.log('Incoming LINE webhook body:', JSON.stringify(req.body, null, 2));
 
-  // Логируем всё, что прислал LINE (для отладки)
-  console.log("✅ LINE webhook event:");
-  console.log(JSON.stringify(req.body, null, 2));
+  // TODO: здесь позже добавим отправку данных в Kommo
+  res.status(200).send('OK');
+});
 
-  // Здесь позже добавим отправку данных в Kommo
-
-  // LINE ожидает 200 OK быстро
-  res.json({ status: "ok" });
+// Заглушка для вебхука от Kommo (на будущее)
+app.post('/kommo/incoming', (req, res) => {
+  console.log('Incoming Kommo webhook body:', JSON.stringify(req.body, null, 2));
+  res.status(200).send('OK');
 });
 
 // Запуск сервера
-const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server is listening on port ${PORT}`);
+  console.log(`Server listening on port ${PORT}`);
 });
