@@ -1,31 +1,70 @@
-const express = require('express');
+// index.js
+// Простой сервер для LINE Webhook → (позже добавим Kommo)
+
+const express = require("express");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Чтобы принимать JSON из LINE и Kommo
-app.use(express.json());
+// Секрет канала LINE из переменной окружения на Render
+const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
 
-// Простой health-check, чтобы проверять, жив ли сервер
-app.get('/', (req, res) => {
-  res.send('LINE–Kommo bridge is running');
+// ---------------------- Health-check ----------------------
+// Чтобы проверить, что сервер жив: GET /status
+app.get("/status", (req, res) => {
+  res.json({
+    ok: true,
+    service: "line-kommo-bridge",
+    timestamp: new Date().toISOString(),
+  });
 });
 
-// Вебхук для LINE
-app.post('/line/webhook', (req, res) => {
-  console.log('Incoming LINE webhook body:', JSON.stringify(req.body, null, 2));
+// ---------------------- LINE Webhook ----------------------
+// LINE будет слать сюда POST-запросы
+app.post(
+  "/line/webhook",
+  // Для проверки подписи нужен "сырое" тело, а не уже распарсенный JSON
+  express.raw({ type: "*/*" }),
+  (req, res) => {
+    try {
+      // Подпись из заголовка
+      const signature = req.headers["x-line-signature"];
 
-  // TODO: здесь позже добавим отправку данных в Kommo
-  res.status(200).send('OK');
-});
+      if (CHANNEL_SECRET) {
+        const computedHash = crypto
+          .createHmac("sha256", CHANNEL_SECRET)
+          .update(req.body) // req.body здесь Buffer
+          .digest("base64");
 
-// Заглушка для вебхука от Kommo (на будущее)
-app.post('/kommo/incoming', (req, res) => {
-  console.log('Incoming Kommo webhook body:', JSON.stringify(req.body, null, 2));
-  res.status(200).send('OK');
-});
+        if (signature !== computedHash) {
+          console.warn("⚠️  Wrong LINE signature");
+          return res.status(401).send("Signature validation failed");
+        }
+      } else {
+        console.warn("⚠️  No CHANNEL_SECRET set, skipping signature check");
+      }
 
-// Запуск сервера
+      const bodyText = req.body.toString("utf8");
+      const json = JSON.parse(bodyText);
+
+      console.log("✅ LINE webhook event received:");
+      console.log(JSON.stringify(json, null, 2));
+
+      // TODO: здесь позже добавим отправку данных в Kommo
+
+      // Важно: быстро ответить 200 OK, чтобы LINE был доволен
+      res.status(200).json({ ok: true });
+    } catch (err) {
+      console.error("❌ Error in /line/webhook handler:", err);
+      res.status(500).send("Internal Server Error");
+    }
+  }
+);
+
+// ---------------------- Start server ----------------------
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`🚀 line-kommo-bridge running on port ${PORT}`);
 });
+
+module.exports = app;
