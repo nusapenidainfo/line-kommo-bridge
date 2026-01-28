@@ -1,5 +1,6 @@
 // index.js
 // Простая связка: LINE webhook -> создание лида в Kommo
+// + приём вебхуков из Kommo (Emfy Webhooks) по адресу /kommo/webhook
 
 const express = require("express");
 const axios = require("axios");
@@ -139,6 +140,27 @@ app.post("/line/webhook", express.text({ type: "*/*" }), async (req, res) => {
   // LINE важно получить ответ быстро
   res.json({ ok: true });
 });
+
+// --------- Webhook из Kommo (Emfy Webhooks) ---------
+// Пока просто логируем всё, что пришло, чтобы понять структуру.
+// Потом сюда добавим отправку ответа в LINE.
+
+app.post(
+  "/kommo/webhook",
+  express.json({ type: "*/*" }),
+  async (req, res) => {
+    try {
+      console.log(
+        "Got Kommo webhook:",
+        JSON.stringify(req.body, null, 2)
+      );
+      res.json({ ok: true });
+    } catch (err) {
+      console.error("Error in /kommo/webhook:", err.message);
+      res.status(500).json({ ok: false });
+    }
+  }
+);
 
 // --------- Запуск сервера ---------
 
