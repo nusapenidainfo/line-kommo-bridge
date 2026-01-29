@@ -1,5 +1,5 @@
 // index.js
-// Простая связка: LINE webhook -> создание лида в Kommo
+// LINE webhook -> создание лида в Kommo
 // + приём вебхуков из Kommo (Emfy Webhooks) по адресу /kommo/webhook
 
 const express = require("express");
@@ -8,7 +8,24 @@ const crypto = require("crypto");
 
 const app = express();
 
-// --------- Служебный статус ---------
+// --------- Базовый CORS для Kommo / Emfy ---------
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    req.header("access-control-request-headers") || "Content-Type"
+  );
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
+// --------- Служебные маршруты ---------
+
+// Статус сервиса
 app.get("/status", (req, res) => {
   res.json({
     ok: true,
@@ -17,9 +34,20 @@ app.get("/status", (req, res) => {
   });
 });
 
+// Корень — тоже JSON, на всякий случай
+app.all("/", (req, res) => {
+  res.json({
+    ok: true,
+    service: "line-kommo-bridge",
+    endpoint: "root",
+    method: req.method,
+    path: req.path,
+  });
+});
+
 // --------- Помощники ---------
 
-// Проверка подписи LINE (если вдруг что-то пойдёт не так — просто логируем)
+// Проверка подписи LINE
 function verifyLineSignature(bodyString, signature) {
   const secret = process.env.LINE_CHANNEL_SECRET;
   if (!secret || !signature) {
@@ -52,13 +80,11 @@ async function createKommoLeadFromLine(lineUserId, text) {
 
   const url = `https://${subdomain}.kommo.com/api/v4/leads`;
 
-  // Название лида: кусок текста + userId, чтобы было понятно, откуда он
   const leadName = `LINE ${lineUserId}: ${text}`.slice(0, 250);
 
   const payload = [
     {
       name: leadName,
-      // можно будет добавить pipeline_id / tags и т.п. позже
     },
   ];
 
@@ -112,7 +138,6 @@ app.post("/line/webhook", express.text({ type: "*/*" }), async (req, res) => {
     return res.json({ ok: true, message: "no events" });
   }
 
-  // Обрабатываем все события
   for (const event of data.events) {
     try {
       if (
@@ -127,7 +152,6 @@ app.post("/line/webhook", express.text({ type: "*/*" }), async (req, res) => {
 
         console.log("New LINE message:", { lineUserId, text });
 
-        // Создаём лид в Kommo
         await createKommoLeadFromLine(lineUserId, text);
       } else {
         console.log("Skip non-text event from LINE");
@@ -137,30 +161,30 @@ app.post("/line/webhook", express.text({ type: "*/*" }), async (req, res) => {
     }
   }
 
-  // LINE важно получить ответ быстро
   res.json({ ok: true });
 });
 
 // --------- Webhook из Kommo (Emfy Webhooks) ---------
-// Пока просто логируем всё, что пришло, чтобы понять структуру.
-// Потом сюда добавим отправку ответа в LINE.
+// Принимаем ЛЮБОЙ метод и ЛЮБОЕ тело как текст.
 
-app.post(
-  "/kommo/webhook",
-  express.json({ type: "*/*" }),
-  async (req, res) => {
-    try {
-      console.log(
-        "Got Kommo webhook:",
-        JSON.stringify(req.body, null, 2)
-      );
-      res.json({ ok: true });
-    } catch (err) {
-      console.error("Error in /kommo/webhook:", err.message);
-      res.status(500).json({ ok: false });
-    }
+app.all("/kommo/webhook", express.text({ type: "*/*" }), async (req, res) => {
+  try {
+    console.log("==== Kommo webhook ====");
+    console.log("Method:", req.method);
+    console.log("Headers:", JSON.stringify(req.headers, null, 2));
+    console.log("Body:", req.body);
+
+    // Отвечаем всегда JSON
+    res.json({
+      ok: true,
+      message: "kommo webhook received",
+      method: req.method,
+    });
+  } catch (err) {
+    console.error("Error in /kommo/webhook:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
   }
-);
+});
 
 // --------- Запуск сервера ---------
 
