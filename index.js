@@ -1,7 +1,7 @@
 // index.js
 // Связка:
 // 1) LINE webhook -> создание лида в Kommo
-// 2) Kommo (Emfy Webhooks) -> наш сервер -> (пока только логируем, позже отправим ответ в LINE)
+// 2) Kommo (Emfy Webhooks) -> наш сервер -> отправка тестового ответа в LINE
 
 const express = require("express");
 const axios = require("axios");
@@ -42,7 +42,48 @@ function verifyLineSignature(bodyString, signature) {
   }
 }
 
-// Создание простого лида в Kommo
+// Отправка сообщения в LINE (push API)
+async function sendLineMessage(to, text) {
+  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+  if (!token) {
+    console.error("LINE_CHANNEL_ACCESS_TOKEN is missing");
+    return;
+  }
+
+  const url = "https://api.line.me/v2/bot/message/push";
+  const payload = {
+    to,
+    messages: [
+      {
+        type: "text",
+        text,
+      },
+    ],
+  };
+
+  try {
+    const resp = await axios.post(url, payload, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 10000,
+    });
+    console.log("LINE message sent to", to, "status", resp.status);
+  } catch (err) {
+    if (err.response) {
+      console.error(
+        "LINE API error:",
+        err.response.status,
+        JSON.stringify(err.response.data)
+      );
+    } else {
+      console.error("LINE request failed:", err.message);
+    }
+  }
+}
+
+// Создание простого лида в Kommo из сообщения LINE
 async function createKommoLeadFromLine(lineUserId, text) {
   const subdomain = process.env.KOMMO_SUBDOMAIN; // andriecas
   const apiKey = process.env.KOMMO_API_KEY; // long-lived token
@@ -165,7 +206,47 @@ app.all(
         }
       }
 
-      console.log("Parsed body:", parsedBody);
+      console.log(
+        "Parsed body:",
+        JSON.stringify(parsedBody, null, 2)
+      );
+
+      // Берём id и имя лида из разных возможных мест
+      const leadId =
+        parsedBody["this_item[id]"] || parsedBody["leads[add][0][id]"] || null;
+
+      const leadName =
+        parsedBody["this_item[name]"] ||
+        parsedBody["leads[add][0][name]"] ||
+        "";
+
+      console.log("Lead from Kommo:", { leadId, leadName });
+
+      // Пытаемся вытащить LINE userId из имени вида "LINE Uxxxx: текст"
+      let lineUserId = null;
+      if (leadName && typeof leadName === "string") {
+        const match = /^LINE\s+([^:]+):/.exec(leadName);
+        if (match) {
+          lineUserId = match[1];
+        }
+      }
+
+      console.log("Extracted lineUserId:", lineUserId);
+
+      if (lineUserId) {
+        const msg = `Test reply from Kommo for your request ${
+          leadId || ""
+        }.`;
+
+        // отправляем, но не ждём, чтобы не задерживать ответ Emfy
+        sendLineMessage(lineUserId, msg).catch((e) =>
+          console.error("sendLineMessage error:", e.message)
+        );
+      } else {
+        console.log(
+          "Could not extract LINE userId from leadName; skipping sendLineMessage"
+        );
+      }
 
       // CORS для фронта Kommo
       res.set("Access-Control-Allow-Origin", "*");
@@ -183,6 +264,9 @@ app.all(
         message: "kommo webhook received",
         method: req.method,
         received: parsedBody,
+        leadId,
+        leadName,
+        lineUserId,
       });
     } catch (err) {
       console.error("Error in /kommo/webhook:", err.message);
