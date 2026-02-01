@@ -1,6 +1,6 @@
 // index.js
 // Связка:
-// 1) LINE webhook -> создание лида в Kommo + сохранение LINE userId в тегах контакта
+// 1) LINE webhook -> создаём контакт + лид в Kommo, сохраняем LINE userId в теге контакта
 // 2) Kommo (Emfy Webhooks) -> наш сервер -> отправка тестового ответа в LINE
 
 const express = require("express");
@@ -24,10 +24,14 @@ app.get("/status", (req, res) => {
 function getKommoCreds() {
   const subdomain = process.env.KOMMO_SUBDOMAIN;
   const apiKey = process.env.KOMMO_API_KEY; // long-lived token
+
   if (!subdomain || !apiKey) {
-    console.error("Kommo credentials are missing. Check KOMMO_SUBDOMAIN and KOMMO_API_KEY");
+    console.error(
+      "Kommo credentials are missing. Check KOMMO_SUBDOMAIN and KOMMO_API_KEY"
+    );
     return null;
   }
+
   return { subdomain, apiKey };
 }
 
@@ -93,25 +97,17 @@ async function sendLineMessage(to, text) {
   }
 }
 
-// Обновляем контакт в Kommo: добавляем теги LINE и LINE_UID_<userId>
-async function attachLineTagsToContact(contactId, lineUserId) {
+// Создать контакт в Kommo для LINE-пользователя
+async function createKommoContactForLineUser(lineUserId) {
   const creds = getKommoCreds();
-  if (!creds) return;
+  if (!creds) return null;
   const { subdomain, apiKey } = creds;
-
-  if (!contactId || !lineUserId) {
-    console.warn("attachLineTagsToContact: no contactId or lineUserId", {
-      contactId,
-      lineUserId,
-    });
-    return;
-  }
 
   const url = `https://${subdomain}.kommo.com/api/v4/contacts`;
 
   const payload = [
     {
-      id: Number(contactId),
+      name: `LINE ${lineUserId}`,
       _embedded: {
         tags: [
           { name: "LINE" },
@@ -122,7 +118,7 @@ async function attachLineTagsToContact(contactId, lineUserId) {
   ];
 
   try {
-    const resp = await axios.patch(url, payload, {
+    const resp = await axios.post(url, payload, {
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
@@ -130,50 +126,54 @@ async function attachLineTagsToContact(contactId, lineUserId) {
       },
       timeout: 10000,
     });
-    console.log(
-      "Contact updated with LINE tags",
+
+    const created = Array.isArray(resp.data) ? resp.data[0] : null;
+    const contactId = created ? created.id : null;
+    console.log("Created Kommo contact for LINE user:", {
+      lineUserId,
       contactId,
-      "status",
-      resp.status
-    );
+    });
+    return contactId;
   } catch (err) {
     if (err.response) {
       console.error(
-        "Kommo API error (attachLineTagsToContact):",
+        "Kommo API error (createKommoContactForLineUser):",
         err.response.status,
         JSON.stringify(err.response.data)
       );
     } else {
       console.error(
-        "Kommo request failed (attachLineTagsToContact):",
+        "Kommo request failed (createKommoContactForLineUser):",
         err.message
       );
     }
+    return null;
   }
 }
 
-// Создание простого лида в Kommo из сообщения LINE
-async function createKommoLeadFromLine(lineUserId, text) {
+// Создать лид в Kommo и привязать к контакту
+async function createKommoLeadForContact(contactId, lineUserId, text) {
   const creds = getKommoCreds();
   if (!creds) return;
   const { subdomain, apiKey } = creds;
 
   const url = `https://${subdomain}.kommo.com/api/v4/leads`;
 
-  // Название лида: текст сообщения (чтобы не путать менеджеров)
-  const leadName = (text && text.trim().length > 0 ? text.trim() : "LINE lead").slice(0, 250);
+  const cleanText =
+    text && text.trim().length > 0 ? text.trim().slice(0, 250) : "LINE lead";
 
   const payload = [
     {
-      name: leadName,
+      name: cleanText,
       _embedded: {
         tags: [{ name: "LINE" }],
+        contacts: contactId ? [{ id: Number(contactId) }] : [],
       },
     },
   ];
 
   try {
-    const response = await axios.post(url, payload, {
+    const resp = await axios.post(url, payload, {
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
@@ -182,40 +182,24 @@ async function createKommoLeadFromLine(lineUserId, text) {
       timeout: 10000,
     });
 
-    const created = Array.isArray(response.data) ? response.data[0] : null;
-    if (!created) {
-      console.log("Kommo lead created, but response has unexpected format");
-      return;
-    }
-
-    console.log("Kommo lead created", `id=${created.id}`, `name=${created.name}`);
-
-    let contactId = null;
-    if (
-      created._embedded &&
-      Array.isArray(created._embedded.contacts) &&
-      created._embedded.contacts.length > 0
-    ) {
-      contactId = created._embedded.contacts[0].id;
-    }
-
-    console.log("Primary contactId for created lead:", contactId);
-
-    // Сохраняем LINE userId в тегах контакта (если контакт есть)
-    if (contactId) {
-      await attachLineTagsToContact(contactId, lineUserId);
-    } else {
-      console.log("No contact attached to lead, cannot store LINE UID tag");
-    }
+    const created = Array.isArray(resp.data) ? resp.data[0] : null;
+    console.log("Kommo lead created from LINE:", {
+      lineUserId,
+      leadId: created ? created.id : null,
+      contactId,
+    });
   } catch (err) {
     if (err.response) {
       console.error(
-        "Kommo API error (createKommoLeadFromLine):",
+        "Kommo API error (createKommoLeadForContact):",
         err.response.status,
         JSON.stringify(err.response.data)
       );
     } else {
-      console.error("Kommo request failed (createKommoLeadFromLine):", err.message);
+      console.error(
+        "Kommo request failed (createKommoLeadForContact):",
+        err.message
+      );
     }
   }
 }
@@ -231,7 +215,7 @@ async function fetchKommoContact(contactId) {
     return null;
   }
 
-  const url = `https://${subdomain}.kommo.com/api/v4/contacts/${contactId}?with=tags`;
+  const url = `https://${subdomain}.kommo.com/api/v4/contacts/${contactId}?with=tags,custom_fields`;
 
   try {
     const resp = await axios.get(url, {
@@ -241,10 +225,9 @@ async function fetchKommoContact(contactId) {
       },
       timeout: 10000,
     });
-    console.log("Loaded contact from Kommo:", {
-      contactId,
-      hasTags: !!(resp.data && resp.data._embedded && resp.data._embedded.tags),
-    });
+    const hasTags =
+      !!(resp.data && resp.data._embedded && resp.data._embedded.tags);
+    console.log("Loaded contact from Kommo:", { contactId, hasTags });
     return resp.data;
   } catch (err) {
     if (err.response) {
@@ -264,20 +247,17 @@ async function fetchKommoContact(contactId) {
 function extractLineUserIdFromContact(contact) {
   if (!contact || typeof contact !== "object") return null;
 
-  // 1) Ищем по тегу LINE_UID_*
+  // 1) Теги вида LINE_UID_XXXXX
   const tags = (contact._embedded && contact._embedded.tags) || [];
   for (const tag of tags) {
     if (!tag || !tag.name) continue;
     if (tag.name.startsWith("LINE_UID_")) {
       const uid = tag.name.replace(/^LINE_UID_/, "").trim();
-      if (uid) {
-        return uid;
-      }
+      if (uid) return uid;
     }
   }
 
-  // 2) Проход по кастомным полям — на случай, если вдруг Kommo/интеграция
-  //    где-то уже хранит LINE userId текстом.
+  // 2) На всякий случай — поиск в кастомных полях
   const cfv = contact.custom_fields_values;
   if (Array.isArray(cfv)) {
     for (const field of cfv) {
@@ -285,7 +265,6 @@ function extractLineUserIdFromContact(contact) {
       for (const v of values) {
         const val = typeof v.value === "string" ? v.value.trim() : null;
         if (!val) continue;
-        // Очень грубая проверка формата LINE userId: обычно "U" + набор символов.
         if (val.startsWith("U") && val.length >= 10) {
           return val;
         }
@@ -332,8 +311,11 @@ app.post("/line/webhook", express.text({ type: "*/*" }), async (req, res) => {
 
         console.log("New LINE message:", { lineUserId, text });
 
-        // Создаём лид в Kommo и вешаем на контакт теги LINE + LINE_UID_<id>
-        await createKommoLeadFromLine(lineUserId, text);
+        // 1) Создаём контакт с тегами LINE + LINE_UID_...
+        const contactId = await createKommoContactForLineUser(lineUserId);
+
+        // 2) Создаём лид и привязываем контакт
+        await createKommoLeadForContact(contactId, lineUserId, text);
       } else {
         console.log("Skip non-text event from LINE");
       }
@@ -376,6 +358,7 @@ app.all(
       const leadNameFromThisItem = parsedBody["this_item[name]"];
       const leadNameFromLeadsAdd = parsedBody["leads[add][0][name]"];
       const leadName = leadNameFromThisItem || leadNameFromLeadsAdd;
+
       const contactId =
         parsedBody["this_item[_embedded][contacts][0][id]"] ||
         parsedBody["this_item[contact][id]"];
@@ -390,7 +373,7 @@ app.all(
 
       let lineUserId = null;
 
-      // 1) Пытаемся вытащить из имени лида вида "LINE <userId>: ..."
+      // 1) Пытаемся вытащить из имени лида "LINE <userId>: ..."
       if (leadName && typeof leadName === "string") {
         const match = /^LINE\s+([^:]+):/.exec(leadName);
         if (match) {
@@ -403,19 +386,16 @@ app.all(
         }
       }
 
-      // 2) Если в имени не нашли — лезем в контакт и ищем теги / поля
+      // 2) Если в имени нет — ищем в контакте (теги LINE_UID_...)
       if (!lineUserId && contactId) {
         console.log(
-          "Trying to fetch contact from Kommo to inspect messenger fields..."
+          "Trying to fetch contact from Kommo to inspect LINE tags..."
         );
         const contact = await fetchKommoContact(contactId);
-        const extractedFromContact = extractLineUserIdFromContact(contact);
-        console.log(
-          "Extracted lineUserId from contact:",
-          extractedFromContact
-        );
-        if (extractedFromContact) {
-          lineUserId = extractedFromContact;
+        const fromContact = extractLineUserIdFromContact(contact);
+        console.log("Extracted lineUserId from contact:", fromContact);
+        if (fromContact) {
+          lineUserId = fromContact;
         }
       }
 
@@ -427,7 +407,6 @@ app.all(
         const msg = `Test reply from Kommo for your request ${
           leadId || ""
         }.`;
-        // отправляем, но не ждём, чтобы не задерживать ответ Emfy
         sendLineMessage(lineUserId, msg).catch((e) =>
           console.error("sendLineMessage error:", e.message)
         );
