@@ -1,7 +1,7 @@
 // index.js
 // Связка:
 // 1) LINE webhook -> создание лида в Kommo
-// 2) Kommo (Emfy Webhooks) -> наш сервер -> поиск LINE userId в Kommo и отправка тестового ответа в LINE
+// 2) Kommo (Emfy Webhooks) -> наш сервер -> попытка ответа в LINE
 
 const express = require("express");
 const axios = require("axios");
@@ -89,9 +89,7 @@ async function createKommoLeadFromLine(lineUserId, text) {
   const apiKey = process.env.KOMMO_API_KEY; // long-lived token
 
   if (!subdomain || !apiKey) {
-    console.error(
-      "Kommo credentials are missing. Check KOMMO_SUBDOMAIN and KOMMO_API_KEY."
-    );
+    console.error("Kommo credentials are missing. Check env variables.");
     return;
   }
 
@@ -135,29 +133,27 @@ async function createKommoLeadFromLine(lineUserId, text) {
   }
 }
 
-// Вытаскиваем LINE userId из имени лида формата "LINE UXXXX: текст"
-function extractLineUserIdFromLeadName(leadName) {
-  if (!leadName || typeof leadName !== "string") return null;
-  const match = /^LINE\s+([^:]+):/.exec(leadName);
-  return match ? match[1] : null;
-}
-
-// Запрос лида в Kommo и попытка найти LINE userId в JSON
-async function findLineUserIdViaKommoApi(leadId) {
+// Получение контакта из Kommo по ID, чтобы увидеть, что там лежит
+async function fetchKommoContact(contactId) {
   const subdomain = process.env.KOMMO_SUBDOMAIN;
   const apiKey = process.env.KOMMO_API_KEY;
 
   if (!subdomain || !apiKey) {
     console.error(
-      "Cannot call Kommo API: KOMMO_SUBDOMAIN or KOMMO_API_KEY is missing"
+      "Kommo credentials are missing for fetchKommoContact. Check env variables."
     );
     return null;
   }
 
-  const url = `https://${subdomain}.kommo.com/api/v4/leads/${leadId}?with=contacts`;
+  if (!contactId) {
+    console.error("fetchKommoContact called without contactId");
+    return null;
+  }
+
+  const url = `https://${subdomain}.kommo.com/api/v4/contacts/${contactId}`;
 
   try {
-    const resp = await axios.get(url, {
+    const response = await axios.get(url, {
       headers: {
         Authorization: `Bearer ${apiKey}`,
         Accept: "application/json",
@@ -165,44 +161,20 @@ async function findLineUserIdViaKommoApi(leadId) {
       timeout: 10000,
     });
 
-    // Чуть-чуть логов для диагностики (отрезаем, чтобы не заспамить)
-    try {
-      const shortLog = JSON.stringify(
-        {
-          id: resp.data && resp.data.id,
-          name: resp.data && resp.data.name,
-          embeddedKeys: resp.data && resp.data._embedded
-            ? Object.keys(resp.data._embedded)
-            : [],
-        },
-        null,
-        2
-      );
-      console.log("Kommo lead short JSON:", shortLog);
-    } catch (e) {
-      console.warn("Cannot stringify Kommo lead short JSON:", e.message);
-    }
-
-    const jsonStr = JSON.stringify(resp.data);
-
-    // Ищем что-то похожее на LINE userId: строка, начинающаяся с U и много hex-символов
-    const match = jsonStr.match(/U[a-f0-9]{10,}/i);
-    if (match) {
-      console.log("Found LINE userId in Kommo JSON:", match[0]);
-      return match[0];
-    }
-
-    console.warn("LINE userId not found in Kommo lead JSON");
-    return null;
+    console.log("Fetched contact from Kommo, id:", contactId);
+    return response.data;
   } catch (err) {
     if (err.response) {
       console.error(
-        "Error while requesting Kommo lead:",
+        "Kommo API error (fetchKommoContact):",
         err.response.status,
         JSON.stringify(err.response.data)
       );
     } else {
-      console.error("Error while requesting Kommo lead:", err.message);
+      console.error(
+        "Kommo request failed in fetchKommoContact:",
+        err.message
+      );
     }
     return null;
   }
@@ -283,6 +255,84 @@ app.all(
 
       console.log("Parsed body:", parsedBody);
 
+      // -----------------------------------------
+      // Пытаемся вытащить leadId / leadName / contactId
+      // -----------------------------------------
+
+      const leadId =
+        parsedBody["this_item[id]"] || parsedBody["leads[add][0][id]"];
+
+      const leadNameFromThisItem = parsedBody["this_item[name]"];
+      const leadNameFromLeadsAdd = parsedBody["leads[add][0][name]"];
+      const leadName = leadNameFromThisItem || leadNameFromLeadsAdd || "";
+
+      const contactId =
+        parsedBody["this_item[_embedded][contacts][0][id]"] ||
+        parsedBody["leads[add][0][_embedded][contacts][0][id]"];
+
+      console.log("Lead from Kommo:", {
+        leadId,
+        leadNameFromLeadsAdd,
+        leadNameFromThisItem,
+        leadName,
+        contactId,
+      });
+
+      let lineUserId = null;
+
+      // 1) Пробуем достать LINE userId из имени лида: "LINE UXXXX: текст..."
+      if (typeof leadName === "string" && leadName.startsWith("LINE ")) {
+        const match = /^LINE\s+([^:]+):/.exec(leadName);
+        if (match) {
+          lineUserId = match[1];
+          console.log("Extracted lineUserId from leadName:", lineUserId);
+        } else {
+          console.log(
+            "Lead name starts with 'LINE', но регулярка не нашла userId."
+          );
+        }
+      } else {
+        console.log(
+          "Lead name does not contain 'LINE <userId>:' pattern, will try contact."
+        );
+      }
+
+      // 2) Если из имени не получилось — пробуем запросить контакт по contactId
+      if (!lineUserId && contactId) {
+        console.log(
+          "Trying to fetch contact from Kommo to inspect messenger fields..."
+        );
+        const contact = await fetchKommoContact(contactId);
+
+        if (contact) {
+          // Логируем полностью, чтобы глазами найти, где LINE ID
+          console.log(
+            "Raw contact payload from Kommo:",
+            JSON.stringify(contact, null, 2)
+          );
+        } else {
+          console.log(
+            "Could not load contact from Kommo for contactId:",
+            contactId
+          );
+        }
+      }
+
+      if (lineUserId) {
+        const msg = `Test reply from Kommo for your request ${
+          leadId || ""
+        }.`;
+
+        // отправляем, но не ждём, чтобы не задерживать ответ Emfy
+        sendLineMessage(lineUserId, msg).catch((e) =>
+          console.error("sendLineMessage error:", e.message)
+        );
+      } else {
+        console.log(
+          "No LINE userId found (neither in lead name nor contact); skipping sendLineMessage"
+        );
+      }
+
       // CORS для фронта Kommo
       res.set("Access-Control-Allow-Origin", "*");
       res.set("Access-Control-Allow-Headers", "*");
@@ -291,47 +341,6 @@ app.all(
       // Preflight запрос
       if (req.method === "OPTIONS") {
         return res.status(200).end();
-      }
-
-      // ---- Логика поиска LINE userId ----
-      const leadIdFromThisItem = parsedBody["this_item[id]"];
-      const leadIdFromAdd = parsedBody["leads[add][0][id]"];
-      const leadNameFromThisItem = parsedBody["this_item[name]"];
-      const leadNameFromLeadsAdd = parsedBody["leads[add][0][name]"];
-
-      const leadId = leadIdFromThisItem || leadIdFromAdd || null;
-      const leadName =
-        (typeof leadNameFromThisItem === "string" && leadNameFromThisItem) ||
-        (typeof leadNameFromLeadsAdd === "string" && leadNameFromLeadsAdd) ||
-        null;
-
-      console.log("Lead from Kommo:", {
-        leadId,
-        leadNameFromLeadsAdd,
-        leadNameFromThisItem,
-        leadName,
-      });
-
-      let lineUserId = extractLineUserIdFromLeadName(leadName);
-      console.log("Extracted lineUserId from leadName:", lineUserId);
-
-      // Если из имени лида не получилось — пробуем через Kommo API
-      if (!lineUserId && leadId) {
-        lineUserId = await findLineUserIdViaKommoApi(leadId);
-      }
-
-      if (lineUserId) {
-        const msg = `Test reply from Kommo for your request ${
-          leadId || ""
-        }.`;
-        // не ждём, чтобы не задерживать ответ Emfy
-        sendLineMessage(lineUserId, msg).catch((e) =>
-          console.error("sendLineMessage error:", e.message)
-        );
-      } else {
-        console.log(
-          "Could not extract LINE userId; skipping sendLineMessage"
-        );
       }
 
       // Отвечаем валидным JSON — этого ждёт виджет Emfy
