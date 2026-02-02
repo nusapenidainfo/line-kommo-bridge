@@ -12,12 +12,26 @@ const app = express();
 
 // ===================== ENV =====================
 
-const KOMMO_SUBDOMAIN = process.env.KOMMO_SUBDOMAIN; // например "andriecas"
-const KOMMO_CLIENT_ID = process.env.KOMMO_CLIENT_ID;
-const KOMMO_CLIENT_SECRET = process.env.KOMMO_CLIENT_SECRET;
+// субдомен Kommo: andriecas.kommo.com -> "andriecas"
+const KOMMO_SUBDOMAIN = process.env.KOMMO_SUBDOMAIN || process.env.KOMMO_DOMAIN;
 
+// Тот самый токен, который уже работал раньше
+const KOMMO_ACCESS_TOKEN = process.env.KOMMO_ACCESS_TOKEN;
+
+// LINE
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+
+if (!KOMMO_SUBDOMAIN) {
+  console.error(
+    "⚠️ KOMMO_SUBDOMAIN (или KOMMO_DOMAIN) не задан. Укажи его в переменных окружения Render."
+  );
+}
+if (!KOMMO_ACCESS_TOKEN) {
+  console.error(
+    "⚠️ KOMMO_ACCESS_TOKEN не задан. Нужен рабочий access token Kommo (тот же, что использовался раньше)."
+  );
+}
 
 // ===================== STATUS =====================
 
@@ -31,53 +45,15 @@ app.get("/status", (req, res) => {
 
 // ===================== HELPERS =====================
 
-// ---- Kommo auth (client_credentials) ----
-
-let kommoTokenCache = {
-  accessToken: null,
-  expiresAt: 0,
-};
-
-async function getKommoAccessToken() {
-  if (
-    kommoTokenCache.accessToken &&
-    kommoTokenCache.expiresAt - Date.now() > 60_000
-  ) {
-    return kommoTokenCache.accessToken;
-  }
-
-  if (!KOMMO_SUBDOMAIN || !KOMMO_CLIENT_ID || !KOMMO_CLIENT_SECRET) {
-    throw new Error(
-      "KOMMO_SUBDOMAIN / KOMMO_CLIENT_ID / KOMMO_CLIENT_SECRET are missing"
-    );
-  }
-
-  const url = `https://${KOMMO_SUBDOMAIN}.kommo.com/oauth2/access_token`;
-
-  const payload = {
-    client_id: KOMMO_CLIENT_ID,
-    client_secret: KOMMO_CLIENT_SECRET,
-    grant_type: "client_credentials",
-  };
-
-  const resp = await axios.post(url, payload, {
-    headers: { "Content-Type": "application/json" },
-    timeout: 10000,
-  });
-
-  const data = resp.data || {};
-  if (!data.access_token || !data.expires_in) {
-    throw new Error("Cannot get access_token from Kommo");
-  }
-
-  kommoTokenCache.accessToken = data.access_token;
-  kommoTokenCache.expiresAt = Date.now() + data.expires_in * 1000;
-
-  return kommoTokenCache.accessToken;
-}
+// ---- Kommo запрос с готовым access_token ----
 
 async function kommoRequest(method, path, data) {
-  const token = await getKommoAccessToken();
+  if (!KOMMO_SUBDOMAIN) {
+    throw new Error("KOMMO_SUBDOMAIN is missing");
+  }
+  if (!KOMMO_ACCESS_TOKEN) {
+    throw new Error("KOMMO_ACCESS_TOKEN is missing");
+  }
 
   const url = `https://${KOMMO_SUBDOMAIN}.kommo.com${path}`;
 
@@ -85,7 +61,7 @@ async function kommoRequest(method, path, data) {
     method,
     url,
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${KOMMO_ACCESS_TOKEN}`,
       "Content-Type": "application/json",
       Accept: "application/json",
     },
@@ -96,8 +72,21 @@ async function kommoRequest(method, path, data) {
     config.data = data;
   }
 
-  const resp = await axios(config);
-  return resp.data;
+  try {
+    const resp = await axios(config);
+    return resp.data;
+  } catch (err) {
+    if (err.response) {
+      console.error(
+        "Kommo API error:",
+        err.response.status,
+        JSON.stringify(err.response.data, null, 2)
+      );
+    } else {
+      console.error("Kommo request failed:", err.message);
+    }
+    throw err;
+  }
 }
 
 // ---- LINE signature (по raw body) ----
@@ -241,7 +230,10 @@ async function ensureKommoContact(lineUserId, displayNameHint) {
       contact = items[0];
     }
   } catch (e) {
-    console.error("Error searching Kommo contacts:", e.message);
+    console.error(
+      "Error searching Kommo contacts:",
+      e.message || e.toString()
+    );
   }
 
   const displayName = displayNameHint || null;
@@ -526,8 +518,6 @@ app.post(
 );
 
 // ===================== KOMMO WEBHOOK =====================
-// Принимаем и GET, и POST, и OPTIONS
-// Тело приходит как x-www-form-urlencoded (строка "a=1&b=2") — разбираем через querystring.parse
 
 app.all(
   "/kommo/webhook",
@@ -550,7 +540,6 @@ app.all(
 
       console.log("Parsed body:", parsedBody);
 
-      // ---- Определяем leadId / contactId из вебхука ----
       const ids = {
         leadId:
           parsedBody["this_item[id]"] ||
@@ -567,7 +556,6 @@ app.all(
 
       console.log("Extracted IDs from Kommo webhook:", ids);
 
-      // ---- Ищем текст ответа ----
       const replyText =
         parsedBody.reply_text ||
         parsedBody["reply_text"] ||
@@ -583,7 +571,6 @@ app.all(
           "Kommo webhook without reply text (probably system event); nothing to send to LINE."
         );
 
-        // CORS для фронта Kommo
         res.set("Access-Control-Allow-Origin", "*");
         res.set("Access-Control-Allow-Headers", "*");
         res.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -599,7 +586,6 @@ app.all(
         });
       }
 
-      // ---- Тянем контакт и lineUserId из Kommo ----
       const { lineUserId } = await getKommoContactAndLineUserId(ids);
 
       console.log("LINE userId from Kommo:", lineUserId);
@@ -626,12 +612,10 @@ app.all(
 
       const finalText = replyText.toString().trim();
 
-      // Отправляем, но не ждём, чтобы не задерживать ответ Emfy
       sendLineMessage(lineUserId, finalText).catch((e) =>
         console.error("sendLineMessage error:", e.message)
       );
 
-      // CORS
       res.set("Access-Control-Allow-Origin", "*");
       res.set("Access-Control-Allow-Headers", "*");
       res.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -640,7 +624,6 @@ app.all(
         return res.status(200).end();
       }
 
-      // Отвечаем валидным JSON — этого ждёт виджет Emfy
       res.json({
         ok: true,
         sent: true,
