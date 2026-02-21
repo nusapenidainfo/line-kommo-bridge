@@ -1,436 +1,744 @@
 // index.js
-// Диагностическая версия LINE ↔ Kommo bridge
-// 1) Подробно логирует, какие ENV-переменные реально видит Node
-// 2) Принимает вебхук из LINE и, если есть креды Kommo, создаёт/находит контакт и лид и пишет note
-// 3) Вебхук из Kommo пока только логируется и отвечает JSON { ok: true }
+// Связка:
+// 1) LINE webhook -> Kommo: найти/создать контакт (по LINE_UID tag) + найти/создать "активный" лид + добавить note с текстом
+// 2) Kommo webhook (Emfy Webhooks) -> наш сервер -> отправить текст ответа в LINE (push)
+// + Диагностика: /status, /debug/env, /debug/kommo, /debug/line
+//
+// ВАЖНО по env:
+// LINE_CHANNEL_SECRET (для проверки подписи)
+// LINE_CHANNEL_ACCESS_TOKEN (long-lived token для Messaging API)
+// KOMMO_SUBDOMAIN
+// KOMMO_ACCESS_TOKEN (рекомендуется) или KOMMO_API_KEY (старое имя, тоже поддерживаем)
+// (опционально) KOMMO_PIPELINE_ID - если хотите всегда создавать лид в конкретной воронке
 
 const express = require("express");
-const bodyParser = require("body-parser");
 const axios = require("axios");
-
-// ======================= БАЗОВАЯ НАСТРОЙКА =======================
+const crypto = require("crypto");
+const querystring = require("querystring");
 
 const app = express();
-app.use(bodyParser.json());
 
-function logTs(...args) {
-  const ts = new Date().toISOString();
-  console.log(`[${ts}]`, ...args);
+/** -------------------- Утилиты логов -------------------- */
+function nowIso() {
+  return new Date().toISOString();
+}
+function rid() {
+  return Math.random().toString(36).slice(2, 10);
+}
+function log(r, ...args) {
+  console.log(`[${nowIso()}] [RID:${r}]`, ...args);
+}
+function warn(r, ...args) {
+  console.warn(`[${nowIso()}] [RID:${r}] ⚠️`, ...args);
+}
+function errlog(r, ...args) {
+  console.error(`[${nowIso()}] [RID:${r}] ❌`, ...args);
 }
 
-// Читаем ENV-переменные (важно: имена должны совпадать с тем, что задано в Render)
-const PORT = process.env.PORT || 10000;
-
-const LINE_CHANNEL_TOKEN = process.env.LINE_CHANNEL_TOKEN || "";
-const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || ""; // пока не используем, но логируем
-
-const KOMMO_BASE_URL = process.env.KOMMO_BASE_URL || "";
-const KOMMO_ACCESS_TOKEN = process.env.KOMMO_ACCESS_TOKEN || "";
-const KOMMO_PIPELINE_ID = process.env.KOMMO_PIPELINE_ID || "";
-const KOMMO_STATUS_ID = process.env.KOMMO_STATUS_ID || "";
-const KOMMO_TAG_ID_LINE = process.env.KOMMO_TAG_ID_LINE || ""; // может быть пустой
-
-// Удобные ф-ции для диагностического вывода
-function lenOr0(value) {
-  if (!value) return 0;
-  return String(value).length;
+/** -------------------- ENV helpers -------------------- */
+function mask(s) {
+  if (!s || typeof s !== "string") return "";
+  if (s.length <= 8) return "***";
+  return `${s.slice(0, 4)}...${s.slice(-4)}`;
+}
+function getKommoToken() {
+  // Поддерживаем 2 варианта, чтобы не ломалось при переименованиях env
+  return process.env.KOMMO_ACCESS_TOKEN || process.env.KOMMO_API_KEY || "";
+}
+function getKommoSubdomain() {
+  return process.env.KOMMO_SUBDOMAIN || "";
+}
+function getLineAccessToken() {
+  return process.env.LINE_CHANNEL_ACCESS_TOKEN || "";
+}
+function getLineChannelSecret() {
+  return process.env.LINE_CHANNEL_SECRET || "";
 }
 
-function shortValue(value) {
-  if (!value) return "(empty)";
-  const s = String(value);
-  if (s.length <= 8) return "*".repeat(s.length);
-  return `${s.slice(0, 4)}***${s.slice(-4)}`;
-}
-
-// Проверяем, считаем ли мы, что креды Kommo заданы
-const hasKommoCreds =
-  !!KOMMO_BASE_URL && !!KOMMO_ACCESS_TOKEN && !!KOMMO_PIPELINE_ID && !!KOMMO_STATUS_ID;
-
-// Диагностический дамп конфига при старте
-logTs("=== CONFIG DUMP START ===");
-logTs("[CONFIG] PORT =", PORT);
-logTs("[CONFIG] LINE_CHANNEL_TOKEN length =", lenOr0(LINE_CHANNEL_TOKEN));
-logTs("[CONFIG] LINE_CHANNEL_SECRET length =", lenOr0(LINE_CHANNEL_SECRET));
-
-logTs("[CONFIG] KOMMO_BASE_URL =", KOMMO_BASE_URL || "(empty)");
-logTs("[CONFIG] KOMMO_ACCESS_TOKEN length =", lenOr0(KOMMO_ACCESS_TOKEN));
-logTs("[CONFIG] KOMMO_PIPELINE_ID =", KOMMO_PIPELINE_ID || "(empty)");
-logTs("[CONFIG] KOMMO_STATUS_ID =", KOMMO_STATUS_ID || "(empty)");
-logTs("[CONFIG] KOMMO_TAG_ID_LINE =", KOMMO_TAG_ID_LINE || "(empty)");
-
-logTs("[CONFIG] hasKommoCreds =", hasKommoCreds);
-if (!hasKommoCreds) {
-  logTs(
-    "[WARN] Kommo creds are incomplete. LINE сообщения будут приниматься, но в Kommo не отправятся."
-  );
-}
-logTs("=== CONFIG DUMP END ===");
-
-// Общий axios-клиент для Kommo (используем только если hasKommoCreds = true)
-const kommo = axios.create({
-  baseURL: KOMMO_BASE_URL.replace(/\/+$/, ""), // убираем хвостовой слэш на всякий случай
-  headers: KOMMO_ACCESS_TOKEN
-    ? {
-        Authorization: `Bearer ${KOMMO_ACCESS_TOKEN}`,
-        "Content-Type": "application/json",
-      }
-    : {},
-  timeout: 15000,
+/** -------------------- Root + status + debug -------------------- */
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "line-kommo-bridge", ts: nowIso() });
 });
 
-// ======================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =======================
+app.get("/status", (req, res) => {
+  res.json({
+    ok: true,
+    service: "line-kommo-bridge",
+    timestamp: nowIso(),
+  });
+});
 
-// Тянем профиль пользователя из LINE по его userId
-async function getLineUserProfile(lineUserId) {
-  if (!LINE_CHANNEL_TOKEN) {
-    logTs(
-      "[WARN] LINE_CHANNEL_TOKEN не задан — профиль LINE получить не можем. Вернём только userId."
-    );
-    return { userId: lineUserId, displayName: null };
+app.get("/debug/env", (req, res) => {
+  // НЕ показываем секреты, только факт наличия
+  const kommoToken = getKommoToken();
+  const lineToken = getLineAccessToken();
+  res.json({
+    ok: true,
+    KOMMO_SUBDOMAIN: !!getKommoSubdomain(),
+    KOMMO_ACCESS_TOKEN_or_API_KEY: !!kommoToken,
+    KOMMO_TOKEN_MASK: kommoToken ? mask(kommoToken) : "",
+    LINE_CHANNEL_SECRET: !!getLineChannelSecret(),
+    LINE_CHANNEL_ACCESS_TOKEN: !!lineToken,
+    LINE_TOKEN_MASK: lineToken ? mask(lineToken) : "",
+    KOMMO_PIPELINE_ID: process.env.KOMMO_PIPELINE_ID || "",
+    ts: nowIso(),
+  });
+});
+
+app.get("/debug/kommo", async (req, res) => {
+  const r = rid();
+  try {
+    const subdomain = getKommoSubdomain();
+    const token = getKommoToken();
+    if (!subdomain || !token) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing KOMMO_SUBDOMAIN or KOMMO_ACCESS_TOKEN/KOMMO_API_KEY",
+      });
+    }
+    const url = `https://${subdomain}.kommo.com/api/v4/account`;
+    const resp = await axios.get(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      timeout: 10000,
+    });
+    log(r, "[DEBUG/KOMMO] account ok:", resp.status);
+    res.json({
+      ok: true,
+      status: resp.status,
+      account_id: resp.data?.id,
+      name: resp.data?.name,
+    });
+  } catch (e) {
+    errlog(r, "[DEBUG/KOMMO] failed:", e.response?.status, e.message);
+    res.status(500).json({
+      ok: false,
+      status: e.response?.status || null,
+      error: e.response?.data || e.message,
+    });
   }
+});
+
+app.get("/debug/line", async (req, res) => {
+  const r = rid();
+  try {
+    const token = getLineAccessToken();
+    if (!token) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Missing LINE_CHANNEL_ACCESS_TOKEN" });
+    }
+    const url = "https://api.line.me/v2/bot/info";
+    const resp = await axios.get(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      timeout: 10000,
+    });
+    log(r, "[DEBUG/LINE] bot info ok:", resp.status);
+    res.json({ ok: true, status: resp.status, bot: resp.data });
+  } catch (e) {
+    errlog(r, "[DEBUG/LINE] failed:", e.response?.status, e.message);
+    res.status(500).json({
+      ok: false,
+      status: e.response?.status || null,
+      error: e.response?.data || e.message,
+    });
+  }
+});
+
+/** -------------------- LINE signature -------------------- */
+function verifyLineSignature(bodyString, signature) {
+  const secret = getLineChannelSecret();
+  if (!secret || !signature) {
+    // Если секрет/подпись не заданы — не блокируем (для диагностики),
+    // но лучше всегда держать секрет включённым.
+    return true;
+  }
+  try {
+    const hash = crypto
+      .createHmac("sha256", secret)
+      .update(bodyString)
+      .digest("base64");
+    return hash === signature;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** -------------------- LINE API -------------------- */
+async function fetchLineProfile(r, userId) {
+  const token = getLineAccessToken();
+  if (!token) {
+    warn(r, "[LINE] Missing LINE_CHANNEL_ACCESS_TOKEN, skip profile fetch");
+    return null;
+  }
+  try {
+    const url = `https://api.line.me/v2/bot/profile/${encodeURIComponent(
+      userId
+    )}`;
+    const resp = await axios.get(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      timeout: 10000,
+    });
+    return resp.data || null;
+  } catch (e) {
+    warn(
+      r,
+      "[LINE] profile fetch failed:",
+      e.response?.status,
+      JSON.stringify(e.response?.data || e.message)
+    );
+    return null;
+  }
+}
+
+async function sendLinePush(r, to, text) {
+  const token = getLineAccessToken();
+  if (!token) {
+    warn(r, "[LINE] Missing LINE_CHANNEL_ACCESS_TOKEN, cannot send");
+    return { ok: false, error: "missing_line_token" };
+  }
+  const url = "https://api.line.me/v2/bot/message/push";
+  const payload = {
+    to,
+    messages: [{ type: "text", text: String(text || "") }],
+  };
 
   try {
-    const url = `https://api.line.me/v2/bot/profile/${encodeURIComponent(lineUserId)}`;
-    const res = await axios.get(url, {
+    const resp = await axios.post(url, payload, {
       headers: {
-        Authorization: `Bearer ${LINE_CHANNEL_TOKEN}`,
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
       },
       timeout: 10000,
     });
-
+    log(r, "[LINE] push sent:", resp.status, "to", to);
+    return { ok: true, status: resp.status };
+  } catch (e) {
+    errlog(
+      r,
+      "[LINE] push error:",
+      e.response?.status,
+      JSON.stringify(e.response?.data || e.message)
+    );
     return {
-      userId: lineUserId,
-      displayName: res.data.displayName || null,
-      pictureUrl: res.data.pictureUrl || null,
-      statusMessage: res.data.statusMessage || null,
-      language: res.data.language || null,
-      raw: res.data,
+      ok: false,
+      status: e.response?.status || null,
+      error: e.response?.data || e.message,
     };
-  } catch (err) {
-    logTs("[ERROR] Не удалось получить профиль LINE:", err.message);
-    if (err.response) {
-      logTs(
-        "[ERROR] LINE profile response:",
-        err.response.status,
-        JSON.stringify(err.response.data, null, 2)
-      );
-    }
-    // Даже если профиль не получили, продолжаем только с userId
-    return { userId: lineUserId, displayName: null };
   }
 }
 
-// Универсальный лог ошибок Kommo
-function logKommoError(prefix, error) {
-  if (!error) {
-    logTs(prefix, "Unknown error");
-    return;
-  }
-  if (error.response) {
-    logTs(
-      prefix,
-      "HTTP",
-      error.response.status,
-      JSON.stringify(error.response.data, null, 2)
-    );
-  } else {
-    logTs(prefix, error.message || String(error));
-  }
+/** -------------------- Kommo API helper -------------------- */
+function kommoBaseUrl() {
+  const sub = getKommoSubdomain();
+  return sub ? `https://${sub}.kommo.com/api/v4` : "";
 }
 
-// ======================= РАБОТА С KOMMO =======================
-
-// 1. Ищем или создаём контакт по LINE userId
-async function findOrCreateKommoContact(lineUserId, profile) {
-  if (!hasKommoCreds) {
-    logTs(
-      "[WARN] findOrCreateKommoContact вызван, но hasKommoCreds = false — пропускаем шаг работы с Kommo."
-    );
-    return null;
+async function kommoRequest(r, method, path, { params, data } = {}) {
+  const token = getKommoToken();
+  const base = kommoBaseUrl();
+  if (!base || !token) {
+    throw new Error("KOMMO_SUBDOMAIN or KOMMO_ACCESS_TOKEN/KOMMO_API_KEY is missing");
   }
 
-  const searchQuery = lineUserId; // будем искать по userId в имени
-  const contactName = `[LINE] ${
-    profile && profile.displayName ? profile.displayName : "LINE user"
-  } (${lineUserId})`;
-
+  const url = `${base}${path}`;
   try {
-    // Сначала пробуем найти контакт
-    logTs(
-      "[KOMMO] Поиск контакта по query (lineUserId):",
-      JSON.stringify({ query: searchQuery })
-    );
-
-    const searchRes = await kommo.get("/api/v4/contacts", {
-      params: { query: searchQuery, limit: 1 },
-    });
-
-    const existing = searchRes.data && Array.isArray(searchRes.data._embedded?.contacts)
-      ? searchRes.data._embedded.contacts[0]
-      : null;
-
-    if (existing) {
-      logTs("[KOMMO] Найден существующий контакт:", {
-        id: existing.id,
-        name: existing.name,
-      });
-      return { id: existing.id, name: existing.name };
-    }
-
-    // Контакт не найден — создаём новый
-    const tags = [];
-
-    // Базовый LINE-тег, если задан ID
-    const lineTagId = KOMMO_TAG_ID_LINE && Number(KOMMO_TAG_ID_LINE);
-    if (!Number.isNaN(lineTagId) && lineTagId > 0) {
-      tags.push({ id: lineTagId });
-    }
-
-    // На всякий случай даём тег по имени "LINE" и персональный тег с userId
-    tags.push({ name: "LINE" });
-    tags.push({ name: `LINE_UID_${lineUserId}` });
-
-    const contactPayload = [
-      {
-        name: contactName,
-        _embedded: {
-          tags,
-        },
+    const resp = await axios({
+      method,
+      url,
+      params,
+      data,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
       },
-    ];
-
-    logTs("[KOMMO] Создаём новый контакт:", JSON.stringify(contactPayload, null, 2));
-
-    const createRes = await kommo.post("/api/v4/contacts", contactPayload);
-
-    const created =
-      createRes.data && Array.isArray(createRes.data._embedded?.contacts)
-        ? createRes.data._embedded.contacts[0]
-        : null;
-
-    if (!created) {
-      logTs("[ERROR] Ответ Kommo на создание контакта без данных _embedded.contacts");
-      return null;
-    }
-
-    logTs("[KOMMO] Контакт создан:", { id: created.id, name: created.name });
-    return { id: created.id, name: created.name };
-  } catch (err) {
-    logKommoError("[ERROR] Ошибка при поиске/создании контакта Kommo:", err);
-    return null;
+      timeout: 15000,
+    });
+    return resp;
+  } catch (e) {
+    const status = e.response?.status;
+    const payload = e.response?.data || e.message;
+    errlog(r, `[KOMMO] ${method} ${path} failed:`, status, JSON.stringify(payload));
+    throw e;
   }
 }
 
-// 2. Ищем или создаём лид для контакта
-async function findOrCreateKommoLead(contact, profile, lastText) {
-  if (!hasKommoCreds) return null;
-  if (!contact || !contact.id) {
-    logTs("[WARN] findOrCreateKommoLead: контакт не задан, пропускаем.");
-    return null;
-  }
+/** -------------------- Kommo business logic -------------------- */
+// Мы идентифицируем LINE пользователя через tag: LINE_UID_<lineUserId>
+function lineUidTag(lineUserId) {
+  return `LINE_UID_${lineUserId}`;
+}
 
+// Поиск контакта по tag через query.
+// Важно: query должен быть строкой, не объектом (это частая причина 400).
+async function findKommoContactByLineUid(r, lineUserId) {
+  const tag = lineUidTag(lineUserId);
+
+  // пробуем query=
   try {
-    logTs("[KOMMO] Ищем лиды по contact_id:", contact.id);
-    const leadsRes = await kommo.get("/api/v4/leads", {
-      params: {
-        "filter[contacts][id]": contact.id,
-        limit: 1,
-      },
+    const resp = await kommoRequest(r, "GET", "/contacts", {
+      params: { query: tag, limit: 50 },
     });
-
-    const existing =
-      leadsRes.data && Array.isArray(leadsRes.data._embedded?.leads)
-        ? leadsRes.data._embedded.leads[0]
-        : null;
-
-    if (existing) {
-      logTs("[KOMMO] Используем существующий лид:", {
-        id: existing.id,
-        name: existing.name,
-        status_id: existing.status_id,
-        pipeline_id: existing.pipeline_id,
-      });
-      return { id: existing.id, name: existing.name };
-    }
-
-    // Лид не найден — создаём
-    const leadName =
-      lastText && lastText.trim().length > 0
-        ? lastText.trim().slice(0, 60)
-        : `[LINE] ${profile && profile.displayName ? profile.displayName : "New lead"}`;
-
-    const leadPayload = [
-      {
-        name: leadName,
-        pipeline_id: Number(KOMMO_PIPELINE_ID),
-        status_id: Number(KOMMO_STATUS_ID),
-        _embedded: {
-          contacts: [{ id: contact.id }],
-          tags: [{ name: "LINE" }],
-        },
-      },
-    ];
-
-    logTs("[KOMMO] Создаём новый лид:", JSON.stringify(leadPayload, null, 2));
-
-    const createRes = await kommo.post("/api/v4/leads", leadPayload);
-
-    const created =
-      createRes.data && Array.isArray(createRes.data._embedded?.leads)
-        ? createRes.data._embedded.leads[0]
-        : null;
-
-    if (!created) {
-      logTs("[ERROR] Ответ Kommo на создание лида без данных _embedded.leads");
-      return null;
-    }
-
-    logTs("[KOMMO] Лид создан:", { id: created.id, name: created.name });
-    return { id: created.id, name: created.name };
-  } catch (err) {
-    logKommoError("[ERROR] Ошибка при поиске/создании лида:", err);
-    return null;
+    const list = resp.data?._embedded?.contacts || [];
+    if (list.length > 0) return list[0];
+  } catch (_) {
+    // fallback ниже
   }
+
+  // fallback: filter[query]
+  try {
+    const resp = await kommoRequest(r, "GET", "/contacts", {
+      params: { "filter[query]": tag, limit: 50 },
+    });
+    const list = resp.data?._embedded?.contacts || [];
+    if (list.length > 0) return list[0];
+  } catch (_) {
+    // no more
+  }
+
+  return null;
 }
 
-// 3. Добавляем note с текстом сообщения LINE в лид
-async function addLineMessageNoteToLead(leadId, lineUserId, text) {
-  if (!hasKommoCreds) return;
-  if (!leadId) {
-    logTs("[WARN] addLineMessageNoteToLead: leadId пустой, note не создаём.");
-    return;
-  }
+async function createKommoContactForLine(r, { lineUserId, displayName }) {
+  const tagUid = lineUidTag(lineUserId);
+  const safeName = displayName ? String(displayName).trim() : "";
+  const contactName = safeName ? `[LINE] ${safeName}` : `[LINE] ${lineUserId}`;
 
-  const finalText =
-    text && text.trim().length > 0
-      ? text.trim()
-      : "(пустое сообщение или неизвестный текст)";
-
-  const note = [
+  const payload = [
     {
-      entity_id: Number(leadId),
-      note_type: "common",
-      params: {
-        text: `LINE message (${lineUserId}): ${finalText}`,
+      name: contactName.slice(0, 250),
+      _embedded: {
+        tags: [{ name: "LINE" }, { name: tagUid }],
       },
     },
   ];
 
+  const resp = await kommoRequest(r, "POST", "/contacts", { data: payload });
+  const created = Array.isArray(resp.data) ? resp.data[0] : null;
+  return created;
+}
+
+async function updateKommoContactNameIfNeeded(r, contactId, desiredName) {
+  if (!contactId || !desiredName) return;
+  const payload = [{ id: contactId, name: desiredName.slice(0, 250) }];
   try {
-    logTs("[KOMMO] Добавляем note к лиду:", JSON.stringify(note, null, 2));
-    const res = await kommo.post("/api/v4/leads/notes", note);
-    logTs("[KOMMO] Note создан, статус:", res.status);
-  } catch (err) {
-    logKommoError("[ERROR] Ошибка при создании note для лида:", err);
+    await kommoRequest(r, "PATCH", "/contacts", { data: payload });
+    log(r, "[KOMMO] contact name updated:", contactId, "->", desiredName);
+  } catch (e) {
+    warn(r, "[KOMMO] contact name update failed:", contactId);
   }
 }
 
-// ======================= ОБРАБОТКА ВЕБХУКА ИЗ LINE =======================
+// Найти "активный" лид по contactId (берём самый свежий незакрытый)
+async function findActiveLeadForContact(r, contactId) {
+  if (!contactId) return null;
 
-async function handleLineWebhook(req, res) {
+  // Пробуем стандартный фильтр
+  const tryList = async (params) => {
+    const resp = await kommoRequest(r, "GET", "/leads", { params });
+    return resp.data?._embedded?.leads || [];
+  };
+
+  let leads = [];
   try {
-    const body = req.body;
-    // Базовый лог — чтобы точно видеть, что вебхук приходит
-    logTs("[LINE] Входящий вебхук:", JSON.stringify(body, null, 2));
-
-    if (!body || !Array.isArray(body.events) || body.events.length === 0) {
-      logTs("[LINE] Нет events в теле вебхука.");
-      return res.status(200).json({ ok: true, message: "no events" });
+    leads = await tryList({
+      limit: 50,
+      order: "updated_at:desc",
+      "filter[contacts][id]": contactId,
+    });
+  } catch (_) {
+    // fallback формат массива
+    try {
+      leads = await tryList({
+        limit: 50,
+        order: "updated_at:desc",
+        "filter[contacts][id][]": contactId,
+      });
+    } catch (_) {
+      leads = [];
     }
-
-    // Берём только первое событие для простоты
-    const event = body.events[0];
-
-    if (!event || event.type !== "message" || !event.message || event.message.type !== "text") {
-      logTs("[LINE] Событие не text-message, пропускаем.");
-      return res.status(200).json({ ok: true, message: "ignored event type" });
-    }
-
-    const lineUserId = event.source && event.source.userId ? event.source.userId : null;
-    const text = event.message && event.message.text ? event.message.text : "";
-
-    logTs("[LINE] Новый текст из LINE {", `lineUserId: '${lineUserId}'`, `text: '${text}'`, "}");
-
-    if (!lineUserId) {
-      logTs("[ERROR] В событии LINE нет source.userId — не можем связать с контактом.");
-      return res.status(200).json({ ok: false, reason: "no userId" });
-    }
-
-    // Тянем профиль пользователя из LINE
-    const profile = await getLineUserProfile(lineUserId);
-    logTs("[LINE] Получен профиль LINE пользователя:", JSON.stringify(profile, null, 2));
-
-    if (!hasKommoCreds) {
-      logTs(
-        "[WARN] Команда findOrCreateKommoContact пропущена – нет Kommo-кредов. Детали:",
-        {
-          KOMMO_BASE_URL: KOMMO_BASE_URL || "(empty)",
-          KOMMO_ACCESS_TOKEN_length: lenOr0(KOMMO_ACCESS_TOKEN),
-          KOMMO_PIPELINE_ID: KOMMO_PIPELINE_ID || "(empty)",
-          KOMMO_STATUS_ID: KOMMO_STATUS_ID || "(empty)",
-        }
-      );
-      // Для LINE возвращаем 200, чтобы вебхук считался обработанным
-      return res.status(200).json({ ok: true, message: "no kommo creds" });
-    }
-
-    // 1) Контакт
-    const contact = await findOrCreateKommoContact(lineUserId, profile);
-    if (!contact || !contact.id) {
-      logTs("[ERROR] Не удалось получить/создать контакт Kommo; дальше не идём.");
-      return res.status(200).json({ ok: false, reason: "no contact" });
-    }
-
-    // 2) Лид
-    const lead = await findOrCreateKommoLead(contact, profile, text);
-    if (!lead || !lead.id) {
-      logTs("[ERROR] Не удалось получить/создать лид Kommo; дальше не идём.");
-      return res.status(200).json({ ok: false, reason: "no lead" });
-    }
-
-    // 3) Note с текстом сообщения
-    await addLineMessageNoteToLead(lead.id, lineUserId, text);
-
-    return res.status(200).json({ ok: true });
-  } catch (err) {
-    logTs("[ERROR] Общая ошибка обработчика LINE вебхука:", err.message);
-    return res.status(500).json({ ok: false, error: err.message });
   }
+
+  if (!Array.isArray(leads) || leads.length === 0) return null;
+
+  // выбираем незакрытый
+  const active = leads.find((l) => !l.closed_at);
+  return active || leads[0];
 }
 
-// ======================= ОБРАБОТКА ВЕБХУКА ИЗ KOMMO =======================
-
-// ВАЖНО: этот обработчик пока только логирует запрос и возвращает JSON,
-// НО НЕ отправляет сообщение в LINE. Это сделано, чтобы не усложнять диагностику.
-// Как только убедимся, что LINE → Kommo работает, добавим обратно логику Kommo → LINE.
-
-async function handleKommoWebhook(req, res) {
-  try {
-    const body = req.body;
-    logTs("[KOMMO WEBHOOK] Входящий вебхук из Kommo:", JSON.stringify(body, null, 2));
-
-    // Здесь пока ничего не делаем, просто возвращаем корректный JSON-ответ,
-    // чтобы Kommo не ругался: "The response must be in JSON format"
-    return res.status(200).json({ ok: true });
-  } catch (err) {
-    logTs("[ERROR] Ошибка в обработчике Kommo вебхука:", err.message);
-    return res.status(500).json({ ok: false, error: err.message });
-  }
+function extractServiceNameFromText(text) {
+  // если текст из формы содержит строку "Service:" — используем для названия лида
+  const s = String(text || "");
+  const m = s.match(/^\s*Service:\s*(.+)\s*$/im);
+  if (m && m[1]) return m[1].trim().slice(0, 60);
+  return "";
 }
 
-// ======================= РОУТЫ =======================
+async function createLeadForContact(r, { contactId, displayName, text }) {
+  const pipelineId = process.env.KOMMO_PIPELINE_ID ? Number(process.env.KOMMO_PIPELINE_ID) : null;
+  const service = extractServiceNameFromText(text);
+  const baseName = displayName ? `[LINE] ${displayName}` : `[LINE] ${contactId}`;
+  const leadName = service ? `${baseName} — ${service}` : baseName;
 
-app.get("/", (req, res) => {
-  res.send("line-kommo-bridge is running");
+  const lead = {
+    name: leadName.slice(0, 250),
+    _embedded: {
+      contacts: [{ id: contactId }],
+      tags: [{ name: "LINE" }],
+    },
+  };
+
+  if (pipelineId && Number.isFinite(pipelineId)) {
+    lead.pipeline_id = pipelineId;
+  }
+
+  const resp = await kommoRequest(r, "POST", "/leads", { data: [lead] });
+  const created = Array.isArray(resp.data) ? resp.data[0] : null;
+  return created;
+}
+
+async function addLeadNote(r, leadId, noteText) {
+  const payload = [
+    {
+      entity_id: leadId,
+      note_type: "common",
+      params: { text: String(noteText || "") },
+    },
+  ];
+  const resp = await kommoRequest(r, "POST", "/leads/notes", { data: payload });
+  return resp.status;
+}
+
+/** -------------------- LINE webhook handler -------------------- */
+async function handleLineTextMessage(r, { lineUserId, text }) {
+  log(r, "✅ New LINE text:", { lineUserId, text });
+
+  // 1) Профиль LINE (displayName)
+  const profile = await fetchLineProfile(r, lineUserId);
+  const displayName = profile?.displayName ? String(profile.displayName) : "";
+  if (profile) {
+    log(r, "👤 LINE profile:", {
+      userId: profile.userId,
+      displayName: profile.displayName,
+      statusMessage: profile.statusMessage,
+    });
+  }
+
+  // 2) Kommo creds check
+  const subdomain = getKommoSubdomain();
+  const token = getKommoToken();
+  if (!subdomain || !token) {
+    warn(r, "KOMMO creds missing -> skip Kommo part", {
+      KOMMO_SUBDOMAIN: !!subdomain,
+      KOMMO_TOKEN: !!token,
+    });
+    return;
+  }
+
+  // 3) Найти/создать контакт по tag LINE_UID_<id>
+  const uidTag = lineUidTag(lineUserId);
+  log(r, "[KOMMO] find contact by tag:", uidTag);
+
+  let contact = await findKommoContactByLineUid(r, lineUserId);
+  if (!contact) {
+    log(r, "[KOMMO] contact not found -> create");
+    contact = await createKommoContactForLine(r, { lineUserId, displayName });
+    log(r, "[KOMMO] contact created:", {
+      id: contact?.id || null,
+      name: contact?.name || null,
+    });
+  } else {
+    log(r, "[KOMMO] contact found:", {
+      id: contact.id,
+      name: contact.name,
+    });
+
+    // обновим имя контакта на displayName (если есть)
+    if (displayName) {
+      const desired = `[LINE] ${displayName}`.slice(0, 250);
+      if (String(contact.name || "") !== desired) {
+        await updateKommoContactNameIfNeeded(r, contact.id, desired);
+      }
+    }
+  }
+
+  const contactId = contact?.id;
+  if (!contactId) {
+    warn(r, "[KOMMO] contactId missing -> cannot continue");
+    return;
+  }
+
+  // 4) Найти активный лид по контакту, иначе создать
+  let lead = await findActiveLeadForContact(r, contactId);
+  if (!lead) {
+    log(r, "[KOMMO] no active lead -> create new lead for contact:", contactId);
+    lead = await createLeadForContact(r, { contactId, displayName, text });
+    log(r, "[KOMMO] lead created:", {
+      id: lead?.id || null,
+      name: lead?.name || null,
+    });
+  } else {
+    log(r, "[KOMMO] using existing lead:", {
+      id: lead.id,
+      name: lead.name,
+      closed_at: lead.closed_at,
+    });
+  }
+
+  const leadId = lead?.id;
+  if (!leadId) {
+    warn(r, "[KOMMO] leadId missing -> cannot add note");
+    return;
+  }
+
+  // 5) Добавить note (сообщение клиента) — это то, что будет видно в ленте лида
+  const header = displayName
+    ? `LINE message from ${displayName}`
+    : `LINE message`;
+  const noteText =
+    `${header}\n` +
+    `LINE userId: ${lineUserId}\n` +
+    `---\n` +
+    `${String(text || "").trim()}`;
+
+  const st = await addLeadNote(r, leadId, noteText);
+  log(r, "[KOMMO] note added:", { leadId, status: st });
+}
+
+app.post("/line/webhook", express.raw({ type: "*/*" }), async (req, res) => {
+  const r = rid();
+  const signature = req.header("x-line-signature");
+  const bodyString = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : String(req.body || "");
+
+  // ЛОГ: факт прихода вебхука
+  log(r, "➡️ /line/webhook", {
+    contentType: req.header("content-type"),
+    len: bodyString.length,
+    hasSignature: !!signature,
+  });
+
+  if (!verifyLineSignature(bodyString, signature)) {
+    errlog(r, "Bad LINE signature");
+    return res.status(401).send("Bad signature");
+  }
+
+  let data;
+  try {
+    data = JSON.parse(bodyString);
+  } catch (e) {
+    errlog(r, "Cannot parse LINE JSON:", e.message);
+    return res.status(400).send("Invalid JSON");
+  }
+
+  const events = Array.isArray(data?.events) ? data.events : [];
+  log(r, "LINE events count:", events.length);
+
+  for (const ev of events) {
+    try {
+      const type = ev?.type;
+      const msgType = ev?.message?.type;
+      const source = ev?.source || {};
+      const lineUserId = source.userId || source.groupId || source.roomId || "unknown";
+
+      // Покажем базовые поля события (очень полезно для диагностики)
+      log(r, "LINE event:", {
+        type,
+        msgType,
+        lineUserId,
+        mode: ev?.mode,
+        timestamp: ev?.timestamp,
+      });
+
+      if (type === "message" && msgType === "text") {
+        const text = ev?.message?.text || "";
+        await handleLineTextMessage(r, { lineUserId, text });
+      } else {
+        log(r, "Skip non-text LINE event");
+      }
+    } catch (e) {
+      errlog(r, "Error processing LINE event:", e.message);
+    }
+  }
+
+  res.json({ ok: true });
 });
 
-app.post("/line/webhook", handleLineWebhook);
-app.post("/kommo/webhook", handleKommoWebhook);
+/** -------------------- Kommo webhook handler (Emfy) -------------------- */
+function setCors(res) {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Headers", "*");
+  res.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+}
 
-// ======================= СТАРТ СЕРВЕРА =======================
+function parseKommoBody(raw, contentType) {
+  const s = typeof raw === "string" ? raw : String(raw || "");
 
+  // если прислали JSON
+  if ((contentType || "").includes("application/json")) {
+    try {
+      return JSON.parse(s);
+    } catch (_) {
+      return { _raw: s };
+    }
+  }
+
+  // чаще всего x-www-form-urlencoded
+  return querystring.parse(s);
+}
+
+function extractFirstString(obj, keys) {
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return "";
+}
+
+function extractKommoIds(parsed) {
+  // стараемся достать leadId/contactId максимально гибко
+  const leadIdStr =
+    extractFirstString(parsed, [
+      "this_item[id]",
+      "leads[add][0][id]",
+      "leads[update][0][id]",
+      "leads[status][0][id]",
+      "leads[0][id]",
+      "lead_id",
+      "leadId",
+    ]) || "";
+
+  const contactIdStr =
+    extractFirstString(parsed, [
+      "this_item[_embedded][contacts][0][id]",
+      "contacts[add][0][id]",
+      "contacts[update][0][id]",
+      "contact_id",
+      "contactId",
+    ]) || "";
+
+  const leadId = leadIdStr ? Number(leadIdStr) : null;
+  const contactId = contactIdStr ? Number(contactIdStr) : null;
+
+  return { leadId, contactId };
+}
+
+function extractReplyTextFromKommo(parsed) {
+  // Здесь мы пытаемся понять, где Emfy/Kommo прислал текст,
+  // который нужно отправить в LINE.
+  //
+  // ВАЖНО: у вас сейчас часто приходят системные события без текста — мы их игнорируем.
+  // Если вы используете кнопку/виджет "LINE Reply", обычно она передаёт поле text/message/reply_text.
+  //
+  // Мы ищем сразу несколько возможных ключей.
+  const candidates = [
+    "reply_text",
+    "reply",
+    "message",
+    "text",
+    "note[text]",
+    "note_text",
+    "this_item[text]",
+    "this_item[note][text]",
+    "this_item[note][0][text]",
+    "chat[text]",
+  ];
+
+  const t = extractFirstString(parsed, candidates);
+  return t;
+}
+
+async function fetchKommoContactTags(r, contactId) {
+  if (!contactId) return [];
+  try {
+    const resp = await kommoRequest(r, "GET", `/contacts/${contactId}`);
+    const tags = resp.data?._embedded?.tags || [];
+    return tags.map((t) => t?.name).filter(Boolean);
+  } catch (e) {
+    return [];
+  }
+}
+
+function extractLineUserIdFromTags(tags) {
+  if (!Array.isArray(tags)) return "";
+  const t = tags.find((x) => typeof x === "string" && x.startsWith("LINE_UID_"));
+  return t ? t.replace("LINE_UID_", "") : "";
+}
+
+app.all("/kommo/webhook", express.text({ type: "*/*" }), async (req, res) => {
+  const r = rid();
+  setCors(res);
+
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
+  try {
+    const contentType = req.header("content-type") || "";
+    const rawBody = req.body || "";
+    const parsed = parseKommoBody(rawBody, contentType);
+
+    // Логи: метод, content-type, длина
+    log(r, "➡️ /kommo/webhook", {
+      method: req.method,
+      contentType,
+      rawLen: typeof rawBody === "string" ? rawBody.length : String(rawBody).length,
+    });
+
+    // Короткий список ключей — супер важно для диагностики
+    const keys = parsed && typeof parsed === "object" ? Object.keys(parsed) : [];
+    log(r, "Kommo parsed keys (first 40):", keys.slice(0, 40));
+
+    const { leadId, contactId } = extractKommoIds(parsed);
+    log(r, "Extracted IDs:", { leadId, contactId });
+
+    const replyText = extractReplyTextFromKommo(parsed);
+    if (!replyText) {
+      log(r, "Kommo webhook without reply text (system event?) -> skip sending to LINE");
+      return res.json({ ok: true, skipped: true, reason: "no_reply_text", leadId, contactId });
+    }
+
+    // Достаем lineUserId из контакта по tag LINE_UID_
+    const subdomain = getKommoSubdomain();
+    const token = getKommoToken();
+    if (!subdomain || !token) {
+      warn(r, "Kommo creds missing -> cannot map contact to LINE userId");
+      return res.json({ ok: false, error: "kommo_creds_missing", leadId, contactId });
+    }
+
+    const tags = await fetchKommoContactTags(r, contactId);
+    const lineUserId = extractLineUserIdFromTags(tags);
+
+    if (!lineUserId) {
+      warn(r, "No LINE userId found in contact tags -> cannot send");
+      return res.json({
+        ok: false,
+        error: "no_line_userId_in_contact_tags",
+        leadId,
+        contactId,
+        replyText,
+      });
+    }
+
+    log(r, "Sending reply to LINE:", { lineUserId, replyText });
+    const sendRes = await sendLinePush(r, lineUserId, replyText);
+
+    res.json({
+      ok: true,
+      leadId,
+      contactId,
+      lineUserId,
+      sent: sendRes.ok,
+      lineStatus: sendRes.status || null,
+    });
+  } catch (e) {
+    errlog(r, "Error in /kommo/webhook:", e.message);
+    setCors(res);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/** -------------------- Start -------------------- */
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  logTs(`line-kommo-bridge is running on port ${PORT}`);
-  logTs("Your service is live 🎉");
+  console.log(`line-kommo-bridge is running on port ${PORT}`);
 });
