@@ -368,9 +368,8 @@ async function createKommoContactFromLine(lineUserId, profile, rid) {
   const payload = [{ name, _embedded: { tags } }];
   log(rid, "[KOMMO] creating contact:", { name });
   const created = await kommoPost("/contacts", payload, rid);
-  return (Array.isArray(created) ? created[0] : null) || null;
+  const contact = created?._embedded?.contacts?.[0] || (Array.isArray(created) ? created[0] : null) || null; return contact;
 }
-
 async function ensureKommoContact(lineUserId, profile, rid) {
   let contact = null;
   try {
@@ -811,3 +810,4 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`line-kommo-bridge is running on port ${PORT}`);
 });
+
