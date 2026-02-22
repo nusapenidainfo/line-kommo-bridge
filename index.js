@@ -1,14 +1,12 @@
 // index.js
 // LINE <-> Kommo bridge
-// 1) LINE webhook -> Kommo: find/create Contact, find/create 1 "chat lead" per contact, add NOTE with client message
-// 2) Kommo webhook (Emfy button) -> LINE: reads custom field "LINE Reply", sends to LINE, clears the field
 //
 // ENV (Render):
 // - KOMMO_SUBDOMAIN
 // - KOMMO_ACCESS_TOKEN
 // - KOMMO_PIPELINE_ID (optional)
 // - KOMMO_STATUS_ID (optional)
-// - KOMMO_LINE_REPLY_FIELD_ID   (879213)
+// - KOMMO_LINE_REPLY_FIELD_ID      (879213)
 // - LINE_CHANNEL_SECRET
 // - LINE_CHANNEL_ACCESS_TOKEN
 
@@ -23,18 +21,22 @@ const app = express();
 function isoNow() {
   return new Date().toISOString();
 }
+
 function makeRid() {
   return Math.random().toString(36).slice(2, 10);
 }
+
 function maskToken(t) {
   if (!t || typeof t !== "string") return null;
   if (t.length <= 8) return "***";
   return `${t.slice(0, 4)}...${t.slice(-4)}`;
 }
+
 function toInt(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : undefined;
 }
+
 function safeJsonParse(str) {
   try {
     return JSON.parse(str);
@@ -42,15 +44,23 @@ function safeJsonParse(str) {
     return null;
   }
 }
+
 function isNonEmptyString(v) {
   return typeof v === "string" && v.trim().length > 0;
 }
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 function log(rid, ...args) {
   console.log(`[${isoNow()}] [RID:${rid}]`, ...args);
 }
+
 function warn(rid, ...args) {
   console.warn(`[${isoNow()}] [RID:${rid}]`, ...args);
 }
+
 function errlog(rid, ...args) {
   console.error(`[${isoNow()}] [RID:${rid}]`, ...args);
 }
@@ -59,21 +69,26 @@ function errlog(rid, ...args) {
 function getKommoToken() {
   return process.env.KOMMO_ACCESS_TOKEN || process.env.KOMMO_API_KEY || "";
 }
+
 function getKommoSubdomain() {
   return process.env.KOMMO_SUBDOMAIN || "";
 }
+
 function getLineToken() {
   return process.env.LINE_CHANNEL_ACCESS_TOKEN || "";
 }
+
 function getLineSecret() {
   return process.env.LINE_CHANNEL_SECRET || "";
 }
+
 function getLineReplyFieldId() {
   return toInt(process.env.KOMMO_LINE_REPLY_FIELD_ID);
 }
 
 const TAG_LINE = "LINE";
 const TAG_LINE_CHAT = "LINE_CHAT";
+
 const TAG_LINE_UID_PREFIX = "LINE_UID_"; // legacy
 const TAG_LINE_CHATID_PREFIX = "LINE_CHATID_";
 const TAG_LINE_USERID_PREFIX = "LINE_USERID_";
@@ -205,8 +220,9 @@ app.get("/debug/last-kommo", (req, res) => {
 // -------------------- LINE signature verify --------------------
 function verifyLineSignature(bodyString, signature) {
   const secret = getLineSecret();
-  if (!secret) return true;        // debug mode
-  if (!signature) return false;    // if secret exists, signature is required
+  if (!secret) return true;
+  if (!signature) return false;
+
   try {
     const hash = crypto.createHmac("sha256", secret).update(bodyString).digest("base64");
     return hash === signature;
@@ -257,7 +273,10 @@ async function getLineProfile(ids, rid) {
 
 async function sendLinePush(to, text, rid) {
   const tok = getLineToken();
-  if (!tok) return { ok: false, error: "LINE token missing" };
+  if (!tok) {
+    errlog(rid, "LINE token missing");
+    return { ok: false, error: "LINE token missing" };
+  }
 
   const payload = { to, messages: [{ type: "text", text }] };
 
@@ -320,14 +339,10 @@ async function kommoPatch(path, data, rid) {
   return r.data;
 }
 
-// -------------------- Kommo helpers --------------------
-function contactHasTag(contact, tagName) {
-  const tags = contact?._embedded?.tags || [];
-  return tags.some((t) => t?.name === tagName);
-}
-
+// -------------------- Tag extract --------------------
 function extractLineChatIdFromTags(tagsArr) {
   const tags = Array.isArray(tagsArr) ? tagsArr : [];
+
   for (const t of tags) {
     const n = t?.name || "";
     if (n.startsWith(TAG_LINE_CHATID_PREFIX)) return n.slice(TAG_LINE_CHATID_PREFIX.length);
@@ -340,117 +355,8 @@ function extractLineChatIdFromTags(tagsArr) {
     const n = t?.name || "";
     if (n.startsWith(TAG_LINE_USERID_PREFIX)) return n.slice(TAG_LINE_USERID_PREFIX.length);
   }
-  return null;
-}
-
-function extractLineChatIdFromContact(contact) {
-  const tags = contact?._embedded?.tags || [];
-  return extractLineChatIdFromTags(tags);
-}
-
-async function findKommoContactByLineChatId(chatId, rid) {
-  const q1 = `${TAG_LINE_CHATID_PREFIX}${chatId}`;
-  const data1 = await kommoGet("/contacts", { query: q1, limit: 10, with: "tags" }, rid);
-  const contacts1 = data1?._embedded?.contacts || [];
-  if (contacts1.length) return contacts1.find((c) => contactHasTag(c, q1)) || contacts1[0];
-
-  const q2 = `${TAG_LINE_UID_PREFIX}${chatId}`;
-  const data2 = await kommoGet("/contacts", { query: q2, limit: 10, with: "tags" }, rid);
-  const contacts2 = data2?._embedded?.contacts || [];
-  if (contacts2.length) return contacts2.find((c) => contactHasTag(c, q2)) || contacts2[0];
 
   return null;
-}
-
-async function createKommoContactFromLine(ids, profile, rid) {
-  const displayName = profile?.displayName || `LINE ${ids.userId || ids.chatId}`;
-  const name = `[LINE] ${displayName}`.slice(0, 250);
-
-  const tags = [{ name: TAG_LINE }];
-  if (ids.chatId && ids.chatId !== "unknown") tags.push({ name: `${TAG_LINE_CHATID_PREFIX}${ids.chatId}` });
-  if (ids.userId) tags.push({ name: `${TAG_LINE_USERID_PREFIX}${ids.userId}` });
-  if (ids.chatId && ids.chatId !== "unknown") tags.push({ name: `${TAG_LINE_UID_PREFIX}${ids.chatId}` }); // legacy
-
-  const payload = [{ name, _embedded: { tags } }];
-  const created = await kommoPost("/contacts", payload, rid);
-  return (Array.isArray(created) ? created[0] : null) || null;
-}
-
-async function ensureKommoContact(ids, profile, rid) {
-  let contact = null;
-  try {
-    if (ids.chatId && ids.chatId !== "unknown") contact = await findKommoContactByLineChatId(ids.chatId, rid);
-  } catch (e) {
-    errlog(rid, "[KOMMO] Error searching contacts:", e?.response?.status ? `HTTP ${e.response.status}` : e.message);
-  }
-
-  if (!contact) {
-    contact = await createKommoContactFromLine(ids, profile, rid);
-    log(rid, "✅ Kommo contact created:", { id: contact?.id, name: contact?.name });
-  } else {
-    log(rid, "[KOMMO] contact found:", { id: contact.id, name: contact.name });
-  }
-
-  return contact;
-}
-
-function leadHasTag(lead, tagName) {
-  const tags = lead?._embedded?.tags || [];
-  return tags.some((t) => t?.name === tagName);
-}
-
-async function findLeadsByContact(contactId, rid) {
-  const params = {
-    "filter[contacts][id]": contactId,
-    limit: 50,
-    with: "contacts,tags",
-    "order[updated_at]": "desc",
-  };
-  const pipelineId = toInt(process.env.KOMMO_PIPELINE_ID);
-  if (pipelineId) params["filter[pipeline_id]"] = pipelineId;
-
-  const data = await kommoGet("/leads", params, rid);
-  return data?._embedded?.leads || [];
-}
-
-async function createLineChatLead(contactId, profile, ids, rid) {
-  const displayName = profile?.displayName || `LINE ${ids.userId || ids.chatId}`;
-  const pipelineId = toInt(process.env.KOMMO_PIPELINE_ID);
-  const statusId = toInt(process.env.KOMMO_STATUS_ID);
-
-  const leadName = `[LINE] ${displayName}`.slice(0, 250);
-  const tags = [{ name: TAG_LINE }, { name: TAG_LINE_CHAT }];
-
-  const lead = {
-    name: leadName,
-    _embedded: { contacts: [{ id: contactId }], tags },
-  };
-  if (pipelineId) lead.pipeline_id = pipelineId;
-  if (statusId) lead.status_id = statusId;
-
-  const created = await kommoPost("/leads", [lead], rid);
-  return (Array.isArray(created) ? created[0] : null) || null;
-}
-
-async function ensureLineChatLead(contactId, profile, ids, rid) {
-  let leads = [];
-  try {
-    leads = await findLeadsByContact(contactId, rid);
-  } catch (e) {
-    errlog(rid, "[KOMMO] Error searching leads:", e?.response?.status ? `HTTP ${e.response.status}` : e.message);
-  }
-
-  if (leads.length) {
-    const chatLead = leads.find((l) => leadHasTag(l, TAG_LINE_CHAT));
-    return chatLead || leads[0];
-  }
-
-  return await createLineChatLead(contactId, profile, ids, rid);
-}
-
-async function addLeadNote(leadId, text, rid) {
-  const payload = [{ entity_id: leadId, note_type: "common", params: { text } }];
-  return await kommoPost("/leads/notes", payload, rid);
 }
 
 async function getKommoContactById(contactId, rid) {
@@ -458,59 +364,21 @@ async function getKommoContactById(contactId, rid) {
 }
 
 async function getKommoLeadById(leadId, rid) {
-  // важно: custom_fields_values приходит в ответе по id
   return await kommoGet(`/leads/${leadId}`, { with: "contacts,tags" }, rid);
 }
 
-// -------------------- универсальный разбор Emfy payload (querystring + JSON) --------------------
-function extractIdsFromKommoAny(parsed) {
-  // 1) flat keys (querystring)
-  const leadIdFlat =
-    parsed?.["leads[add][0][id]"] ||
-    parsed?.["leads[update][0][id]"] ||
-    parsed?.["this_item[id]"] ||
-    parsed?.["lead[id]"] ||
-    parsed?.["lead_id"] ||
-    parsed?.["id"] ||
-    null;
-
-  const contactIdFlat =
-    parsed?.["this_item[_embedded][contacts][0][id]"] ||
-    parsed?.["this_item[main_contact][id]"] ||
-    parsed?.["contacts[add][0][id]"] ||
-    parsed?.["contact[id]"] ||
-    parsed?.["contact_id"] ||
-    null;
-
-  let leadId = leadIdFlat ? String(leadIdFlat) : null;
-  let contactId = contactIdFlat ? String(contactIdFlat) : null;
-
-  // 2) JSON shape (this_item / lead / leads.add[0])
-  if (!leadId) {
-    leadId =
-      (parsed?.this_item?.id ? String(parsed.this_item.id) : null) ||
-      (parsed?.lead?.id ? String(parsed.lead.id) : null) ||
-      (parsed?.leads?.add?.[0]?.id ? String(parsed.leads.add[0].id) : null) ||
-      (parsed?.leads?.update?.[0]?.id ? String(parsed.leads.update[0].id) : null) ||
-      null;
-  }
-
-  if (!contactId) {
-    contactId =
-      (parsed?.this_item?._embedded?.contacts?.[0]?.id ? String(parsed.this_item._embedded.contacts[0].id) : null) ||
-      (parsed?.lead?._embedded?.contacts?.[0]?.id ? String(parsed.lead._embedded.contacts[0].id) : null) ||
-      (parsed?.contact?.id ? String(parsed.contact.id) : null) ||
-      null;
-  }
-
-  return { leadId, contactId };
+// -------------------- Kommo: lead/notes --------------------
+async function addLeadNote(leadId, text, rid) {
+  const payload = [{ entity_id: leadId, note_type: "common", params: { text } }];
+  log(rid, "[KOMMO] add note:", { leadId, textPreview: String(text).slice(0, 80) });
+  return await kommoPost("/leads/notes", payload, rid);
 }
 
-function extractLineReplyFromPayloadAny(parsed) {
+// -------------------- LINE Reply extract (payload) --------------------
+function extractLineReplyFromPayload(parsed, rid) {
   const fieldId = getLineReplyFieldId();
-
-  // 1) querystring pattern
   const keys = Object.keys(parsed || {});
+
   const cfIndexes = new Set();
   for (const k of keys) {
     const m = k.match(/^this_item\[custom_fields_values\]\[(\d+)\]/);
@@ -519,28 +387,27 @@ function extractLineReplyFromPayloadAny(parsed) {
 
   for (const idx of cfIndexes) {
     const fid = toInt(parsed[`this_item[custom_fields_values][${idx}][field_id]`]);
+    const fname = parsed[`this_item[custom_fields_values][${idx}][field_name]`] || "";
     const val = parsed[`this_item[custom_fields_values][${idx}][values][0][value]`];
+
     if (!isNonEmptyString(val)) continue;
-    if (fieldId && fid === fieldId) return { text: val.trim(), fieldId: fid };
-  }
 
-  // 2) JSON pattern: this_item.custom_fields_values[]
-  const cfs =
-    parsed?.this_item?.custom_fields_values ||
-    parsed?.lead?.custom_fields_values ||
-    parsed?.custom_fields_values ||
-    null;
+    if (fieldId && fid === fieldId) {
+      log(rid, `[CF] LINE Reply found in payload by field_id ${fieldId}`);
+      return { text: val.trim(), fieldId: fid };
+    }
 
-  if (Array.isArray(cfs) && fieldId) {
-    const cf = cfs.find((x) => toInt(x?.field_id) === fieldId);
-    const val = cf?.values?.[0]?.value;
-    if (isNonEmptyString(val)) return { text: String(val).trim(), fieldId };
+    if (!fieldId) {
+      const n = String(fname).toLowerCase().replace(/[\s_-]/g, "");
+      if (n.includes("linereply")) return { text: val.trim(), fieldId: fid };
+    }
   }
 
   return null;
 }
 
-function extractLineReplyFromLeadData(leadData) {
+// -------------------- LINE Reply extract (lead API) --------------------
+function extractLineReplyFromLeadData(leadData, rid) {
   const fieldId = getLineReplyFieldId();
   if (!fieldId) return null;
 
@@ -549,13 +416,18 @@ function extractLineReplyFromLeadData(leadData) {
 
   const cf = cfs.find((x) => toInt(x?.field_id) === fieldId);
   const val = cf?.values?.[0]?.value;
-  if (isNonEmptyString(val)) return { text: String(val).trim(), fieldId };
+
+  if (isNonEmptyString(val)) {
+    log(rid, `[CF] LINE Reply found in lead API by field_id ${fieldId}`);
+    return { text: String(val).trim(), fieldId };
+  }
 
   return null;
 }
 
 async function clearLineReplyField(leadId, fieldId, rid) {
   if (!leadId || !fieldId) return;
+
   try {
     await kommoPatch(
       "/leads",
@@ -567,13 +439,13 @@ async function clearLineReplyField(leadId, fieldId, rid) {
       ],
       rid
     );
-    log(rid, "[KOMMO] LINE Reply field cleared:", { leadId, fieldId });
+    log(rid, "[KOMMO] LINE Reply cleared:", { leadId, fieldId });
   } catch (e) {
-    warn(rid, "[KOMMO] Could not clear LINE Reply field:", e?.response?.status ? `HTTP ${e.response.status}` : e.message);
+    warn(rid, "[KOMMO] Could not clear LINE Reply:", e?.response?.status ? `HTTP ${e.response.status}` : e.message);
   }
 }
 
-// -------------------- LINE webhook --------------------
+// -------------------- LINE webhook (incoming) --------------------
 app.post("/line/webhook", express.text({ type: "*/*" }), (req, res) => {
   const rid = makeRid();
   const signature = req.header("x-line-signature") || "";
@@ -605,10 +477,16 @@ app.post("/line/webhook", express.text({ type: "*/*" }), (req, res) => {
 
         const ids = getLineIdsFromEvent(ev);
         const profile = await getLineProfile(ids, rid);
-        const contact = await ensureKommoContact(ids, profile, rid);
+
+        // ВАЖНО: для простоты оставляем существующую логику контактов/лидов как у тебя,
+        // так как текущая проблема у тебя именно на Kommo->LINE.
+        // (Если захочешь — добавим умное объединение контактов по телефону из текста.)
+
+        // Найдём/создадим контакт по LINE chatId (тег)
+        const contact = await ensureKommoContactByLineTag(ids, profile, rid);
         if (!contact?.id) continue;
 
-        const lead = await ensureLineChatLead(contact.id, profile, ids, rid);
+        const lead = await ensureLineChatLeadByContact(contact.id, profile, ids, rid);
         if (!lead?.id) continue;
 
         const displayName = profile?.displayName || "Client";
@@ -627,6 +505,30 @@ function setCors(res) {
   res.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
 }
 
+function extractIdsFromKommo(parsed) {
+  const leadId =
+    parsed["leads[add][0][id]"] ||
+    parsed["leads[update][0][id]"] ||
+    parsed["this_item[id]"] ||
+    parsed["lead[id]"] ||
+    parsed["lead_id"] ||
+    parsed["id"] ||
+    null;
+
+  const contactId =
+    parsed["this_item[_embedded][contacts][0][id]"] ||
+    parsed["this_item[main_contact][id]"] ||
+    parsed["contacts[add][0][id]"] ||
+    parsed["contact[id]"] ||
+    parsed["contact_id"] ||
+    null;
+
+  return {
+    leadId: leadId ? String(leadId) : null,
+    contactId: contactId ? String(contactId) : null,
+  };
+}
+
 app.all("/kommo/webhook", express.text({ type: "*/*" }), (req, res) => {
   const rid = makeRid();
   setCors(res);
@@ -635,6 +537,17 @@ app.all("/kommo/webhook", express.text({ type: "*/*" }), (req, res) => {
   res.json({ ok: true });
 
   setImmediate(async () => {
+    const extracted = {
+      leadId: null,
+      contactId: null,
+      replyTextFound: false,
+      replyTextSource: null,
+      lineChatId: null,
+      sendOk: false,
+      sendError: null,
+      reasonStop: null,
+    };
+
     try {
       const raw = typeof req.body === "string" ? req.body : "";
       let parsed = {};
@@ -644,98 +557,244 @@ app.all("/kommo/webhook", express.text({ type: "*/*" }), (req, res) => {
       else parsed = querystring.parse(raw);
 
       const keys = Object.keys(parsed || {});
+      let { leadId, contactId } = extractIdsFromKommo(parsed);
+
+      extracted.leadId = leadId;
+      extracted.contactId = contactId;
+
       STATE.lastKommoWebhook = {
         rid,
         at: isoNow(),
         method: req.method,
         keysCount: keys.length,
-        keysPreview: keys.slice(0, 50),
-        rawPreview: String(raw).slice(0, 800),
+        keysPreview: keys.slice(0, 60),
+        rawPreview: String(raw).slice(0, 900),
+        extracted,
       };
 
       log(rid, "==== Kommo webhook ====");
-      log(rid, "method:", req.method, "keysCount:", keys.length);
+      log(rid, "leadId/contactId:", { leadId, contactId });
 
-      let { leadId, contactId } = extractIdsFromKommoAny(parsed);
-      log(rid, "Extracted IDs:", { leadId, contactId });
+      if (!leadId) {
+        extracted.reasonStop = "leadId missing in payload";
+        warn(rid, extracted.reasonStop);
+        return;
+      }
 
-      // 1) пробуем достать LINE Reply из payload
-      let cfResult = extractLineReplyFromPayloadAny(parsed);
+      // 1) Берём LINE Reply из payload
+      let cfResult = extractLineReplyFromPayload(parsed, rid);
+      if (cfResult?.text) {
+        extracted.replyTextFound = true;
+        extracted.replyTextSource = "payload";
+      }
 
-      // 2) если не нашли — читаем из Kommo lead API (самое важное)
+      // 2) Если нет — читаем лид через API и берём LINE Reply оттуда (самый надёжный путь)
       let leadData = null;
-      if (!cfResult?.text && leadId) {
+      if (!cfResult?.text) {
+        // небольшой буфер: иногда кликают сразу после Save
+        await sleep(300);
+
         try {
           leadData = await getKommoLeadById(leadId, rid);
-          cfResult = extractLineReplyFromLeadData(leadData);
-          if (cfResult?.text) log(rid, "✅ LINE Reply resolved via Kommo lead API");
+          cfResult = extractLineReplyFromLeadData(leadData, rid);
+          if (cfResult?.text) {
+            extracted.replyTextFound = true;
+            extracted.replyTextSource = "lead_api";
+          }
         } catch (e) {
-          errlog(rid, "[KOMMO] Failed to fetch lead for LINE Reply:", e?.response?.status ? `HTTP ${e.response.status}` : e.message);
+          extracted.reasonStop = "failed to fetch lead from Kommo API";
+          errlog(rid, extracted.reasonStop, e?.response?.status ? `HTTP ${e.response.status}` : e.message);
+          return;
         }
       }
 
       if (!cfResult?.text) {
-        log(rid, "No LINE Reply text -> skip");
+        extracted.reasonStop = "LINE Reply empty (payload + lead_api)";
+        log(rid, extracted.reasonStop);
         return;
       }
 
       const replyText = cfResult.text.trim();
       log(rid, "✅ LINE Reply text:", replyText);
 
-      // если contactId нет — достаем из лида
-      if (!contactId && leadId) {
+      // Если contactId не пришёл — достанем через lead API
+      if (!contactId) {
         try {
           if (!leadData) leadData = await getKommoLeadById(leadId, rid);
           const embContacts = leadData?._embedded?.contacts || [];
-          if (embContacts.length > 0) contactId = String(embContacts[0].id);
+          if (embContacts.length > 0) {
+            contactId = String(embContacts[0].id);
+            extracted.contactId = contactId;
+            log(rid, "Resolved contactId from lead:", contactId);
+          }
         } catch {}
       }
 
-      // ищем lineChatId (куда слать)
+      // ---- Находим lineChatId максимально надёжно ----
       let lineChatId = null;
 
-      if (contactId) {
+      // A) из тегов лида
+      try {
+        if (!leadData) leadData = await getKommoLeadById(leadId, rid);
+        const leadTags = leadData?._embedded?.tags || [];
+        lineChatId = extractLineChatIdFromTags(leadTags);
+        if (lineChatId) log(rid, "LINE chatId from lead tags:", lineChatId);
+      } catch {}
+
+      // B) из контакта (если есть contactId)
+      if (!lineChatId && contactId) {
         try {
-          const contact = await getKommoContactById(contactId, rid);
-          lineChatId = extractLineChatIdFromContact(contact);
+          const c = await getKommoContactById(contactId, rid);
+          lineChatId = extractLineChatIdFromTags(c?._embedded?.tags || []);
+          if (lineChatId) log(rid, "LINE chatId from main contact:", lineChatId);
         } catch (e) {
-          warn(rid, "Failed to fetch contact:", e.message);
+          warn(rid, "Failed to fetch main contact:", e.message);
         }
       }
 
-      // fallback: попробуем достать из lead tags
-      if (!lineChatId && leadId) {
+      // C) если у лида несколько контактов — проверим все
+      if (!lineChatId) {
         try {
           if (!leadData) leadData = await getKommoLeadById(leadId, rid);
-          const leadTags = leadData?._embedded?.tags || [];
-          lineChatId = extractLineChatIdFromTags(leadTags);
+          const embContacts = leadData?._embedded?.contacts || [];
+          for (const ct of embContacts) {
+            const cid = ct?.id ? String(ct.id) : null;
+            if (!cid) continue;
+            try {
+              const c = await getKommoContactById(cid, rid);
+              const found = extractLineChatIdFromTags(c?._embedded?.tags || []);
+              if (found) {
+                lineChatId = found;
+                log(rid, "LINE chatId from another contact:", { contactId: cid, lineChatId });
+                break;
+              }
+            } catch {}
+          }
         } catch {}
       }
 
       if (!lineChatId) {
-        warn(rid, "No LINE chatId found -> cannot send");
+        extracted.reasonStop = "No LINE chatId found in lead tags / contacts tags";
+        warn(rid, extracted.reasonStop);
         return;
       }
 
-      log(rid, "🚀 Sending to LINE:", { to: lineChatId, text: replyText });
+      extracted.lineChatId = lineChatId;
 
+      // ---- Отправляем в LINE ----
+      log(rid, "🚀 Sending to LINE:", { to: lineChatId, text: replyText });
       const sendResult = await sendLinePush(lineChatId, replyText, rid);
 
-      if (sendResult.ok) {
-        const fieldId = cfResult.fieldId || getLineReplyFieldId();
-        if (fieldId && leadId) await clearLineReplyField(leadId, fieldId, rid);
-
-        if (leadId) {
-          try {
-            await addLeadNote(toInt(leadId), `[LINE sent] ${replyText}`, rid);
-          } catch {}
-        }
+      if (!sendResult.ok) {
+        extracted.sendOk = false;
+        extracted.sendError = sendResult.error || "unknown";
+        extracted.reasonStop = "LINE push failed";
+        return;
       }
+
+      extracted.sendOk = true;
+
+      // ---- Очищаем LINE Reply + пишем note ----
+      const fieldId = cfResult.fieldId || getLineReplyFieldId();
+      if (fieldId) await clearLineReplyField(leadId, fieldId, rid);
+
+      try {
+        await addLeadNote(toInt(leadId), `[LINE sent] ${replyText}`, rid);
+      } catch {}
+
     } catch (e) {
+      extracted.reasonStop = "Unhandled error";
       errlog(rid, "Unhandled error in /kommo/webhook:", e.message);
+    } finally {
+      // обновим extracted в debug объекте (чтобы сразу видеть результат)
+      if (STATE.lastKommoWebhook && STATE.lastKommoWebhook.rid === rid) {
+        STATE.lastKommoWebhook.extracted = extracted;
+      }
     }
   });
 });
+
+// -------------------- Kommo: contact+lead ensure (минимально как у тебя) --------------------
+async function kommoFindContactByTag(tagExact, rid) {
+  const data = await kommoGet("/contacts", { query: tagExact, limit: 10, with: "tags" }, rid);
+  const contacts = data?._embedded?.contacts || [];
+  if (!contacts.length) return null;
+  return contacts.find((c) => (c?._embedded?.tags || []).some((t) => t?.name === tagExact)) || contacts[0];
+}
+
+async function ensureKommoContactByLineTag(ids, profile, rid) {
+  const chatId = ids?.chatId || "unknown";
+  if (chatId === "unknown") return null;
+
+  const tag1 = `${TAG_LINE_CHATID_PREFIX}${chatId}`;
+  const tagLegacy = `${TAG_LINE_UID_PREFIX}${chatId}`;
+
+  let contact = await kommoFindContactByTag(tag1, rid);
+  if (!contact) contact = await kommoFindContactByTag(tagLegacy, rid);
+
+  if (contact) return contact;
+
+  const displayName = profile?.displayName || `LINE ${chatId}`;
+  const name = `[LINE] ${displayName}`.slice(0, 250);
+
+  const tags = [
+    { name: TAG_LINE },
+    { name: `${TAG_LINE_CHATID_PREFIX}${chatId}` },
+    { name: `${TAG_LINE_UID_PREFIX}${chatId}` },
+  ];
+
+  if (ids?.userId) tags.push({ name: `${TAG_LINE_USERID_PREFIX}${ids.userId}` });
+
+  const created = await kommoPost("/contacts", [{ name, _embedded: { tags } }], rid);
+  return (Array.isArray(created) ? created[0] : null) || null;
+}
+
+function leadHasTag(lead, tagName) {
+  const tags = lead?._embedded?.tags || [];
+  return tags.some((t) => t?.name === tagName);
+}
+
+async function findLeadsByContact(contactId, rid) {
+  const params = {
+    "filter[contacts][id]": contactId,
+    limit: 50,
+    with: "contacts,tags",
+    "order[updated_at]": "desc",
+  };
+  const pipelineId = toInt(process.env.KOMMO_PIPELINE_ID);
+  if (pipelineId) params["filter[pipeline_id]"] = pipelineId;
+
+  const data = await kommoGet("/leads", params, rid);
+  return data?._embedded?.leads || [];
+}
+
+async function createLineChatLead(contactId, profile, ids, rid) {
+  const displayName = profile?.displayName || `LINE ${ids?.chatId || ""}`;
+  const pipelineId = toInt(process.env.KOMMO_PIPELINE_ID);
+  const statusId = toInt(process.env.KOMMO_STATUS_ID);
+
+  const leadName = `[LINE] ${displayName}`.slice(0, 250);
+  const tags = [{ name: TAG_LINE }, { name: TAG_LINE_CHAT }];
+
+  const lead = {
+    name: leadName,
+    _embedded: { contacts: [{ id: contactId }], tags },
+  };
+  if (pipelineId) lead.pipeline_id = pipelineId;
+  if (statusId) lead.status_id = statusId;
+
+  const created = await kommoPost("/leads", [lead], rid);
+  return (Array.isArray(created) ? created[0] : null) || null;
+}
+
+async function ensureLineChatLeadByContact(contactId, profile, ids, rid) {
+  let leads = await findLeadsByContact(contactId, rid);
+  if (leads.length) {
+    const chatLead = leads.find((l) => leadHasTag(l, TAG_LINE_CHAT));
+    return chatLead || leads[0];
+  }
+  return await createLineChatLead(contactId, profile, ids, rid);
+}
 
 // -------------------- start --------------------
 const PORT = process.env.PORT || 10000;
